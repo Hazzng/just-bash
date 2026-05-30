@@ -11,7 +11,8 @@
  */
 
 import { randomBytes } from "node:crypto";
-import { fileURLToPath } from "node:url";
+import { readFile } from "node:fs/promises";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { Worker } from "node:worker_threads";
 import { decodeBytesToUtf8 } from "../../encoding.js";
 import type { IFileSystem } from "../../fs/interface.js";
@@ -191,6 +192,67 @@ export function _resetExecutionQueue(): void {
 }
 
 const workerPath = fileURLToPath(new URL("./worker.js", import.meta.url));
+
+/**
+ * Compile the CPython WASM module once per process and reuse it across every
+ * python3 invocation. WebAssembly compilation of the ~5.7MB CPython binary is
+ * the dominant per-call cost on many machines; without this each fresh worker
+ * recompiles from scratch. A compiled `WebAssembly.Module` is immutable and
+ * structured-cloneable, so it can be handed to each worker via workerData and
+ * instantiated there (cheap) instead of recompiled. Every execution still runs
+ * in its own fresh worker — isolation is unchanged.
+ *
+ * Best-effort: if the binary can't be read or compiled (e.g. unusual bundle
+ * layout), we fall back to letting the worker compile normally.
+ */
+let _compiledWasmPromise: Promise<WebAssembly.Module | null> | null = null;
+
+/** The only WASM binary this command is allowed to read and compile. */
+const CPYTHON_WASM_BASENAME = "/vendor/cpython-emscripten/python.wasm";
+
+/**
+ * Defense-in-depth: mirror the worker's `assertApprovedPath` allowlist so the
+ * main thread only ever reads the vendored CPython WASM binary, never a path
+ * outside the approved vendor bundle.
+ */
+function assertApprovedWasmPath(path: string): void {
+  if (!path.replace(/\\/g, "/").endsWith(CPYTHON_WASM_BASENAME)) {
+    throw new Error(
+      `[Defense-in-depth] rejected wasm path outside approved vendor bundle: ${path}`,
+    );
+  }
+}
+
+/**
+ * Returns the process-wide compiled CPython module, compiling it on first call
+ * and caching the result. Never rejects: read/compile failures resolve to
+ * `null` (cached, so we don't retry) and callers fall back to letting the
+ * worker compile normally.
+ */
+function getCompiledWasm(): Promise<WebAssembly.Module | null> {
+  if (!_compiledWasmPromise) {
+    _compiledWasmPromise = (async () => {
+      try {
+        // The worker resolves the vendor dir as "../../../vendor" relative to
+        // its own location; the same relative path from the worker dir locates
+        // the wasm binary in every build layout (src, dist/commands,
+        // dist/bin/chunks).
+        const wasmPath = fileURLToPath(
+          new URL(
+            "../../../vendor/cpython-emscripten/python.wasm",
+            pathToFileURL(workerPath),
+          ),
+        );
+        assertApprovedWasmPath(wasmPath);
+        const bin = await readFile(wasmPath);
+        return await WebAssembly.compile(bin);
+      } catch {
+        return null;
+      }
+    })();
+  }
+  return _compiledWasmPromise;
+}
 
 function generateWorkerProtocolToken(): string {
   return randomBytes(16).toString("hex");
@@ -412,6 +474,11 @@ async function executePython(
     : userTimeout;
   const queueState = getQueueState(ctx.fs);
 
+  // Reuse the process-wide compiled CPython module so the worker skips
+  // recompiling the WASM binary. Best-effort: resolves to undefined when the
+  // binary can't be read or compiled, and the worker compiles normally.
+  const compiledWasm = (await getCompiledWasm()) ?? undefined;
+
   const workerInput: WorkerInput = {
     protocolToken: generateWorkerProtocolToken(),
     sharedBuffer,
@@ -423,6 +490,7 @@ async function executePython(
     args: scriptArgs,
     scriptPath,
     timeoutMs,
+    compiledWasm,
   };
 
   const workerRef: { current: Worker | null } = { current: null };
