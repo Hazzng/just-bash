@@ -475,9 +475,36 @@ async function executePython(
   const queueState = getQueueState(ctx.fs);
 
   // Reuse the process-wide compiled CPython module so the worker skips
-  // recompiling the WASM binary. Best-effort: resolves to undefined when the
-  // binary can't be read or compiled, and the worker compiles normally.
-  const compiledWasm = (await getCompiledWasm()) ?? undefined;
+  // recompiling the WASM binary. The (one-time, cold) compile runs on the main
+  // thread, so bound it by the execution timeout: if it can't finish within the
+  // budget, fall back to letting the worker compile normally (under its own
+  // timeout) rather than blocking unbounded past maxPythonTimeoutMs. The
+  // compile keeps running in the background and is cached for the next call.
+  // Best-effort either way (resolves to undefined on read/compile failure).
+  let compileTimer: ReturnType<typeof _setTimeout> | undefined;
+  const compiledOrTimeout = await Promise.race<WebAssembly.Module | null>([
+    getCompiledWasm(),
+    new Promise<null>((resolve) => {
+      // Mirror the worker-timeout dispatch pattern: timeout callbacks on WASM
+      // command paths must run through a defense-context-bound, sanitized wrapper.
+      const onCompileTimeout = bindDefenseContextCallback(
+        ctx.requireDefenseContext,
+        "python3",
+        "wasm compile timeout callback",
+        () => resolve(null),
+      );
+      const dispatchCompileTimeout = (): void => {
+        try {
+          onCompileTimeout();
+        } catch {
+          resolve(null);
+        }
+      };
+      compileTimer = _setTimeout(dispatchCompileTimeout, timeoutMs);
+    }),
+  ]);
+  if (compileTimer !== undefined) _clearTimeout(compileTimer);
+  const compiledWasm = compiledOrTimeout ?? undefined;
 
   const workerInput: WorkerInput = {
     protocolToken: generateWorkerProtocolToken(),
