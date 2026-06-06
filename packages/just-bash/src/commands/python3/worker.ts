@@ -33,6 +33,13 @@ export interface WorkerInput {
   args: string[];
   scriptPath?: string;
   timeoutMs?: number;
+  /**
+   * Pre-compiled CPython WASM module shared from the main thread. When present,
+   * the worker instantiates it directly instead of reading and recompiling the
+   * ~5.7MB binary, eliminating the dominant per-call startup cost. Optional —
+   * the worker falls back to normal compilation when absent.
+   */
+  compiledWasm?: WebAssembly.Module;
 }
 
 export interface WorkerOutput {
@@ -632,7 +639,6 @@ function generateSetupCode(input: WorkerInput): string {
   return `
 import os
 import sys
-import json
 
 ${envSetup}
 
@@ -735,22 +741,6 @@ def _redir_chdir(path):
     return _orig_chdir(path)
 os.chdir = _redir_chdir
 
-# glob
-import glob as _glob_module
-_orig_glob = _glob_module.glob
-def _redir_glob(pathname, *args, **kwargs):
-    if _should_redirect(pathname):
-        pathname = '/host' + pathname
-    return _orig_glob(pathname, *args, **kwargs)
-_glob_module.glob = _redir_glob
-
-_orig_iglob = _glob_module.iglob
-def _redir_iglob(pathname, *args, **kwargs):
-    if _should_redirect(pathname):
-        pathname = '/host' + pathname
-    return _orig_iglob(pathname, *args, **kwargs)
-_glob_module.iglob = _redir_iglob
-
 # os.walk
 _orig_walk = os.walk
 def _redir_walk(top, *args, **kwargs):
@@ -776,151 +766,185 @@ os.scandir = _redir_scandir
 import io as _io_module
 _io_module.open = builtins.open
 
-# shutil
-import shutil as _shutil_module
+# Lazy path redirection for glob/shutil/pathlib.
+#
+# Importing these modules pulls in 're'/'fnmatch', which costs real time on every
+# CPython startup. Most scripts never touch them, so instead of importing and
+# patching eagerly we register patchers that run only when (and if) user code
+# imports the module. The redirection semantics are identical to patching
+# eagerly — it just happens on first import instead of at startup.
+def _jb_patch_glob(_glob_module):
+    _orig_glob = _glob_module.glob
+    def _redir_glob(pathname, *args, **kwargs):
+        if _should_redirect(pathname):
+            pathname = '/host' + pathname
+        return _orig_glob(pathname, *args, **kwargs)
+    _glob_module.glob = _redir_glob
+    _orig_iglob = _glob_module.iglob
+    def _redir_iglob(pathname, *args, **kwargs):
+        if _should_redirect(pathname):
+            pathname = '/host' + pathname
+        return _orig_iglob(pathname, *args, **kwargs)
+    _glob_module.iglob = _redir_iglob
 
-_orig_shutil_copy = _shutil_module.copy
-def _redir_shutil_copy(src, dst, *args, **kwargs):
-    if _should_redirect(src): src = '/host' + src
-    if _should_redirect(dst): dst = '/host' + dst
-    return _orig_shutil_copy(src, dst, *args, **kwargs)
-_shutil_module.copy = _redir_shutil_copy
+def _jb_patch_shutil(_shutil_module):
+    _orig_shutil_copy = _shutil_module.copy
+    def _redir_shutil_copy(src, dst, *args, **kwargs):
+        if _should_redirect(src): src = '/host' + src
+        if _should_redirect(dst): dst = '/host' + dst
+        return _orig_shutil_copy(src, dst, *args, **kwargs)
+    _shutil_module.copy = _redir_shutil_copy
+    _orig_shutil_copy2 = _shutil_module.copy2
+    def _redir_shutil_copy2(src, dst, *args, **kwargs):
+        if _should_redirect(src): src = '/host' + src
+        if _should_redirect(dst): dst = '/host' + dst
+        return _orig_shutil_copy2(src, dst, *args, **kwargs)
+    _shutil_module.copy2 = _redir_shutil_copy2
+    _orig_shutil_copyfile = _shutil_module.copyfile
+    def _redir_shutil_copyfile(src, dst, *args, **kwargs):
+        if _should_redirect(src): src = '/host' + src
+        if _should_redirect(dst): dst = '/host' + dst
+        return _orig_shutil_copyfile(src, dst, *args, **kwargs)
+    _shutil_module.copyfile = _redir_shutil_copyfile
+    _orig_shutil_copytree = _shutil_module.copytree
+    def _redir_shutil_copytree(src, dst, *args, **kwargs):
+        if _should_redirect(src): src = '/host' + src
+        if _should_redirect(dst): dst = '/host' + dst
+        return _orig_shutil_copytree(src, dst, *args, **kwargs)
+    _shutil_module.copytree = _redir_shutil_copytree
+    _orig_shutil_move = _shutil_module.move
+    def _redir_shutil_move(src, dst, *args, **kwargs):
+        if _should_redirect(src): src = '/host' + src
+        if _should_redirect(dst): dst = '/host' + dst
+        return _orig_shutil_move(src, dst, *args, **kwargs)
+    _shutil_module.move = _redir_shutil_move
+    _orig_shutil_rmtree = _shutil_module.rmtree
+    def _redir_shutil_rmtree(path, *args, **kwargs):
+        if _should_redirect(path): path = '/host' + path
+        return _orig_shutil_rmtree(path, *args, **kwargs)
+    _shutil_module.rmtree = _redir_shutil_rmtree
 
-_orig_shutil_copy2 = _shutil_module.copy2
-def _redir_shutil_copy2(src, dst, *args, **kwargs):
-    if _should_redirect(src): src = '/host' + src
-    if _should_redirect(dst): dst = '/host' + dst
-    return _orig_shutil_copy2(src, dst, *args, **kwargs)
-_shutil_module.copy2 = _redir_shutil_copy2
-
-_orig_shutil_copyfile = _shutil_module.copyfile
-def _redir_shutil_copyfile(src, dst, *args, **kwargs):
-    if _should_redirect(src): src = '/host' + src
-    if _should_redirect(dst): dst = '/host' + dst
-    return _orig_shutil_copyfile(src, dst, *args, **kwargs)
-_shutil_module.copyfile = _redir_shutil_copyfile
-
-_orig_shutil_copytree = _shutil_module.copytree
-def _redir_shutil_copytree(src, dst, *args, **kwargs):
-    if _should_redirect(src): src = '/host' + src
-    if _should_redirect(dst): dst = '/host' + dst
-    return _orig_shutil_copytree(src, dst, *args, **kwargs)
-_shutil_module.copytree = _redir_shutil_copytree
-
-_orig_shutil_move = _shutil_module.move
-def _redir_shutil_move(src, dst, *args, **kwargs):
-    if _should_redirect(src): src = '/host' + src
-    if _should_redirect(dst): dst = '/host' + dst
-    return _orig_shutil_move(src, dst, *args, **kwargs)
-_shutil_module.move = _redir_shutil_move
-
-_orig_shutil_rmtree = _shutil_module.rmtree
-def _redir_shutil_rmtree(path, *args, **kwargs):
-    if _should_redirect(path): path = '/host' + path
-    return _orig_shutil_rmtree(path, *args, **kwargs)
-_shutil_module.rmtree = _redir_shutil_rmtree
-
-# pathlib.Path
-from pathlib import Path
-
-def _redirect_path(p):
-    s = str(p)
-    if _should_redirect(s):
-        return Path('/host' + s)
-    return p
-
-Path._orig_stat = Path.stat
-def _path_stat(self, *args, **kwargs):
-    return _redirect_path(self)._orig_stat(*args, **kwargs)
-Path.stat = _path_stat
-
-Path._orig_exists = Path.exists
-def _path_exists(self):
-    return _redirect_path(self)._orig_exists()
-Path.exists = _path_exists
-
-Path._orig_is_file = Path.is_file
-def _path_is_file(self):
-    return _redirect_path(self)._orig_is_file()
-Path.is_file = _path_is_file
-
-Path._orig_is_dir = Path.is_dir
-def _path_is_dir(self):
-    return _redirect_path(self)._orig_is_dir()
-Path.is_dir = _path_is_dir
-
-Path._orig_open = Path.open
-def _path_open(self, *args, **kwargs):
-    return _redirect_path(self)._orig_open(*args, **kwargs)
-Path.open = _path_open
-
-Path._orig_read_text = Path.read_text
-def _path_read_text(self, *args, **kwargs):
-    return _redirect_path(self)._orig_read_text(*args, **kwargs)
-Path.read_text = _path_read_text
-
-Path._orig_read_bytes = Path.read_bytes
-def _path_read_bytes(self):
-    return _redirect_path(self)._orig_read_bytes()
-Path.read_bytes = _path_read_bytes
-
-Path._orig_write_text = Path.write_text
-def _path_write_text(self, *args, **kwargs):
-    return _redirect_path(self)._orig_write_text(*args, **kwargs)
-Path.write_text = _path_write_text
-
-Path._orig_write_bytes = Path.write_bytes
-def _path_write_bytes(self, data):
-    return _redirect_path(self)._orig_write_bytes(data)
-Path.write_bytes = _path_write_bytes
-
-Path._orig_mkdir = Path.mkdir
-def _path_mkdir(self, *args, **kwargs):
-    return _redirect_path(self)._orig_mkdir(*args, **kwargs)
-Path.mkdir = _path_mkdir
-
-Path._orig_rmdir = Path.rmdir
-def _path_rmdir(self):
-    return _redirect_path(self)._orig_rmdir()
-Path.rmdir = _path_rmdir
-
-Path._orig_unlink = Path.unlink
-def _path_unlink(self, *args, **kwargs):
-    return _redirect_path(self)._orig_unlink(*args, **kwargs)
-Path.unlink = _path_unlink
-
-Path._orig_iterdir = Path.iterdir
-def _path_iterdir(self):
-    redirected = _redirect_path(self)
-    for p in redirected._orig_iterdir():
+def _jb_patch_pathlib(_pathlib_module):
+    Path = _pathlib_module.Path
+    def _redirect_path(p):
         s = str(p)
-        if s.startswith('/host'):
-            yield Path(s[5:])
-        else:
-            yield p
-Path.iterdir = _path_iterdir
+        if _should_redirect(s):
+            return Path('/host' + s)
+        return p
+    Path._orig_stat = Path.stat
+    def _path_stat(self, *args, **kwargs):
+        return _redirect_path(self)._orig_stat(*args, **kwargs)
+    Path.stat = _path_stat
+    Path._orig_exists = Path.exists
+    def _path_exists(self):
+        return _redirect_path(self)._orig_exists()
+    Path.exists = _path_exists
+    Path._orig_is_file = Path.is_file
+    def _path_is_file(self):
+        return _redirect_path(self)._orig_is_file()
+    Path.is_file = _path_is_file
+    Path._orig_is_dir = Path.is_dir
+    def _path_is_dir(self):
+        return _redirect_path(self)._orig_is_dir()
+    Path.is_dir = _path_is_dir
+    Path._orig_open = Path.open
+    def _path_open(self, *args, **kwargs):
+        return _redirect_path(self)._orig_open(*args, **kwargs)
+    Path.open = _path_open
+    Path._orig_read_text = Path.read_text
+    def _path_read_text(self, *args, **kwargs):
+        return _redirect_path(self)._orig_read_text(*args, **kwargs)
+    Path.read_text = _path_read_text
+    Path._orig_read_bytes = Path.read_bytes
+    def _path_read_bytes(self):
+        return _redirect_path(self)._orig_read_bytes()
+    Path.read_bytes = _path_read_bytes
+    Path._orig_write_text = Path.write_text
+    def _path_write_text(self, *args, **kwargs):
+        return _redirect_path(self)._orig_write_text(*args, **kwargs)
+    Path.write_text = _path_write_text
+    Path._orig_write_bytes = Path.write_bytes
+    def _path_write_bytes(self, data):
+        return _redirect_path(self)._orig_write_bytes(data)
+    Path.write_bytes = _path_write_bytes
+    Path._orig_mkdir = Path.mkdir
+    def _path_mkdir(self, *args, **kwargs):
+        return _redirect_path(self)._orig_mkdir(*args, **kwargs)
+    Path.mkdir = _path_mkdir
+    Path._orig_rmdir = Path.rmdir
+    def _path_rmdir(self):
+        return _redirect_path(self)._orig_rmdir()
+    Path.rmdir = _path_rmdir
+    Path._orig_unlink = Path.unlink
+    def _path_unlink(self, *args, **kwargs):
+        return _redirect_path(self)._orig_unlink(*args, **kwargs)
+    Path.unlink = _path_unlink
+    Path._orig_iterdir = Path.iterdir
+    def _path_iterdir(self):
+        redirected = _redirect_path(self)
+        for p in redirected._orig_iterdir():
+            s = str(p)
+            if s.startswith('/host'):
+                yield Path(s[5:])
+            else:
+                yield p
+    Path.iterdir = _path_iterdir
+    Path._orig_glob = Path.glob
+    def _path_glob(self, pattern):
+        redirected = _redirect_path(self)
+        for p in redirected._orig_glob(pattern):
+            s = str(p)
+            if s.startswith('/host'):
+                yield Path(s[5:])
+            else:
+                yield p
+    Path.glob = _path_glob
+    Path._orig_rglob = Path.rglob
+    def _path_rglob(self, pattern):
+        redirected = _redirect_path(self)
+        for p in redirected._orig_rglob(pattern):
+            s = str(p)
+            if s.startswith('/host'):
+                yield Path(s[5:])
+            else:
+                yield p
+    Path.rglob = _path_rglob
 
-Path._orig_glob = Path.glob
-def _path_glob(self, pattern):
-    redirected = _redirect_path(self)
-    for p in redirected._orig_glob(pattern):
-        s = str(p)
-        if s.startswith('/host'):
-            yield Path(s[5:])
-        else:
-            yield p
-Path.glob = _path_glob
+_jb_lazy = {'glob': _jb_patch_glob, 'shutil': _jb_patch_shutil, 'pathlib': _jb_patch_pathlib}
 
-Path._orig_rglob = Path.rglob
-def _path_rglob(self, pattern):
-    redirected = _redirect_path(self)
-    for p in redirected._orig_rglob(pattern):
-        s = str(p)
-        if s.startswith('/host'):
-            yield Path(s[5:])
-        else:
-            yield p
-Path.rglob = _path_rglob
+# Patch any target already imported (normally none are at this point).
+for _jb_name in list(_jb_lazy):
+    if _jb_name in sys.modules:
+        _jb_lazy.pop(_jb_name)(sys.modules[_jb_name])
+
+# Hook future imports. Wrap both builtins.__import__ (the import statement) and
+# importlib.import_module so neither entry point can bypass redirection. The
+# wrappers remove themselves once every target has been patched.
+if _jb_lazy:
+    import builtins as _jb_b
+    import importlib as _jb_il
+    _jb_orig_import = _jb_b.__import__
+    _jb_orig_import_module = _jb_il.import_module
+    def _jb_apply(name):
+        base = name.partition('.')[0] if name else ''
+        fn = _jb_lazy.pop(base, None)
+        if fn is not None and base in sys.modules:
+            fn(sys.modules[base])
+        if not _jb_lazy:
+            _jb_b.__import__ = _jb_orig_import
+            _jb_il.import_module = _jb_orig_import_module
+    def _jb_import(name, *a, **k):
+        mod = _jb_orig_import(name, *a, **k)
+        if _jb_lazy:
+            _jb_apply(name)
+        return mod
+    _jb_b.__import__ = _jb_import
+    def _jb_import_module(name, package=None):
+        mod = _jb_orig_import_module(name, package)
+        if _jb_lazy and name and not name.startswith('.'):
+            _jb_apply(name)
+        return mod
+    _jb_il.import_module = _jb_import_module
 
 # Set cwd to host mount
 os.chdir('/host' + ${JSON.stringify(input.cwd)})
@@ -1092,8 +1116,9 @@ function generateHttpBridgeCode(): string {
 # HTTP bridge: jb_http module
 # Write request JSON to /_jb_http/request (custom FS triggers HTTP via SharedArrayBuffer)
 # Then read response JSON from same path.
-
-import base64 as _base64
+# Note: base64/json are imported lazily inside the methods that need them so the
+# bridge adds no import cost (notably 're', pulled in by base64) to runs that
+# never make an HTTP request.
 
 class _JbHttpResponse:
     """HTTP response object similar to requests.Response"""
@@ -1106,6 +1131,7 @@ class _JbHttpResponse:
         self._error = data.get('error')
         b64 = data.get('bodyBase64')
         if b64 is not None:
+            import base64 as _base64
             self.content = _base64.b64decode(b64)
             self.text = self.content.decode('utf-8', errors='replace')
         else:
@@ -1117,7 +1143,8 @@ class _JbHttpResponse:
         return 200 <= self.status_code < 300
 
     def json(self):
-        return json.loads(self.text)
+        import json as _json
+        return _json.loads(self.text)
 
     def raise_for_status(self):
         if self._error:
@@ -1139,7 +1166,8 @@ class _JbHttp:
 
     def request(self, method, url, headers=None, data=None, json_data=None):
         if json_data is not None:
-            data = json.dumps(json_data)
+            import json as _json
+            data = _json.dumps(json_data)
             headers = headers or {}
             headers['Content-Type'] = 'application/json'
         result = self._do_request(method, url, headers, data)
@@ -1288,11 +1316,54 @@ async function runPython(input: WorkerInput): Promise<WorkerOutput> {
       },
     );
 
+    // Reuse the pre-compiled module shared from the main thread when available:
+    // instantiate it directly instead of recompiling the ~5.7MB binary. This is
+    // the dominant per-call startup cost. WASM instantiation happens here, before
+    // defense-in-depth activates, exactly as a normal compile+instantiate would.
+    // When no compiled module was shared, `instantiateWasm` stays undefined and
+    // Emscripten compiles the binary itself (its check on this option is
+    // truthy-based, so an undefined value is equivalent to omitting it).
+    const compiled = input.compiledWasm;
+    const instantiateWasm = compiled
+      ? wrapWasmCallback(
+          "python3-worker",
+          "instantiateWasm",
+          (
+            imports: WebAssembly.Imports,
+            receive: (
+              instance: WebAssembly.Instance,
+              module: WebAssembly.Module,
+            ) => void,
+          ) => {
+            WebAssembly.instantiate(compiled, imports).then(
+              (instance) => receive(instance, compiled),
+              (err) => {
+                // Instantiating a valid, same-binary module should never fail,
+                // but if it does, surface it explicitly rather than hanging
+                // until the execution timeout (the createPythonModule await
+                // would never resolve since Emscripten's instantiateWasm has no
+                // reject path).
+                const message = sanitizeHostErrorMessage(
+                  err instanceof Error ? err.message : String(err),
+                );
+                postWorkerMessage(input.protocolToken, {
+                  success: false,
+                  error: `Failed to instantiate CPython WASM: ${message}`,
+                });
+              },
+            );
+            // @banned-pattern-ignore: Emscripten's instantiateWasm contract requires returning {} to signal asynchronous instantiation
+            return {};
+          },
+        )
+      : undefined;
+
     Module = await createPythonModule({
       noInitialRun: true,
       preRun: [onPreRun],
       print: onPrint,
       printErr: onPrintErr,
+      instantiateWasm,
     });
   } catch (e) {
     const message = sanitizeHostErrorMessage((e as Error).message);
