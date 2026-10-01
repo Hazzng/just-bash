@@ -2,15 +2,20 @@
  * date - Display the current date and time
  */
 
-import type { Command, CommandContext, ExecResult } from "../../types.js";
+import type {
+  ExecResult,
+  RuntimeCommand,
+  RuntimeCommandContext,
+} from "../../types.js";
 import { hasHelpFlag, showHelp, unknownOption } from "../help.js";
+import { formatStrftime } from "../printf/strftime.js";
 
 const dateHelp = {
   name: "date",
   summary: "display the current time in the given FORMAT",
   usage: "date [OPTION]... [+FORMAT]",
   options: [
-    "-d, --date=STRING   display time described by STRING",
+    "-d, --date=STRING   display time described by STRING, not 'now'",
     "-u, --utc           print Coordinated Universal Time (UTC)",
     "-I, --iso-8601      output date/time in ISO 8601 format",
     "-R, --rfc-email     output RFC 5322 date format",
@@ -18,143 +23,118 @@ const dateHelp = {
   ],
 };
 
-const DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-const MONTHS = [
-  "Jan",
-  "Feb",
-  "Mar",
-  "Apr",
-  "May",
-  "Jun",
-  "Jul",
-  "Aug",
-  "Sep",
-  "Oct",
-  "Nov",
-  "Dec",
-];
-
-function pad(n: number, w = 2): string {
-  return String(n).padStart(w, "0");
-}
-
-function formatDate(d: Date, fmt: string, _utc: boolean): string {
-  // Always use UTC in the sandbox to prevent leaking the host timezone
-  // through %Z, %z, or the time values themselves.
-  const g = {
-    Y: d.getUTCFullYear(),
-    m: d.getUTCMonth(),
-    D: d.getUTCDate(),
-    H: d.getUTCHours(),
-    M: d.getUTCMinutes(),
-    S: d.getUTCSeconds(),
-    w: d.getUTCDay(),
-  };
-
-  let r = "",
-    i = 0;
-  while (i < fmt.length) {
-    if (fmt[i] === "%" && i + 1 < fmt.length) {
-      const s = fmt[++i];
-      switch (s) {
-        case "%":
-          r += "%";
-          break;
-        case "a":
-          r += DAYS[g.w];
-          break;
-        case "b":
-        case "h":
-          r += MONTHS[g.m];
-          break;
-        case "d":
-          r += pad(g.D);
-          break;
-        case "e":
-          r += String(g.D).padStart(2, " ");
-          break;
-        case "F":
-          r += `${g.Y}-${pad(g.m + 1)}-${pad(g.D)}`;
-          break;
-        case "H":
-          r += pad(g.H);
-          break;
-        case "I":
-          r += pad(g.H % 12 || 12);
-          break;
-        case "m":
-          r += pad(g.m + 1);
-          break;
-        case "M":
-          r += pad(g.M);
-          break;
-        case "n":
-          r += "\n";
-          break;
-        case "p":
-          r += g.H < 12 ? "AM" : "PM";
-          break;
-        case "P":
-          r += g.H < 12 ? "am" : "pm";
-          break;
-        case "R":
-          r += `${pad(g.H)}:${pad(g.M)}`;
-          break;
-        case "s":
-          r += Math.floor(d.getTime() / 1000);
-          break;
-        case "S":
-          r += pad(g.S);
-          break;
-        case "t":
-          r += "\t";
-          break;
-        case "T":
-          r += `${pad(g.H)}:${pad(g.M)}:${pad(g.S)}`;
-          break;
-        case "u":
-          r += g.w || 7;
-          break;
-        case "w":
-          r += g.w;
-          break;
-        case "y":
-          r += pad(g.Y % 100);
-          break;
-        case "Y":
-          r += g.Y;
-          break;
-        case "z":
-          r += "+0000";
-          break;
-        case "Z":
-          r += "UTC";
-          break;
-        default:
-          r += `%${s}`;
-      }
-    } else {
-      r += fmt[i];
-    }
-    i++;
+/**
+ * True iff `tz` is a timezone Intl understands. Used to fall back to host-local
+ * when `TZ` is set to a value Node's ICU build can't resolve, matching GNU
+ * `date` (which silently uses local time on invalid `TZ`).
+ */
+function isValidTimezone(tz: string): boolean {
+  try {
+    new Intl.DateTimeFormat(undefined, { timeZone: tz });
+    return true;
+  } catch {
+    return false;
   }
-  return r;
 }
 
-function parseDate(s: string): Date | null {
-  const d = new Date(s);
-  if (!Number.isNaN(d.getTime())) return d;
-  if (/^\d+$/.test(s)) return new Date(Number.parseInt(s, 10) * 1000);
-  const l = s.toLowerCase();
+/**
+ * Return what `tz` shows at instant `d`, encoded as a UTC Date whose
+ * UTC components equal the wall-clock components shown in `tz`.
+ * Returns null if Intl rejects the timezone or produces an unparseable date.
+ */
+function tzShownAsUtc(d: Date, tz: string): Date | null {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: tz,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }).formatToParts(d);
+  const get = (t: string) => parts.find((p) => p.type === t)?.value ?? "00";
+  const h = Number.parseInt(get("hour"), 10) % 24;
+  const shown = new Date(
+    `${get("year")}-${get("month")}-${get("day")}T${String(h).padStart(2, "0")}:${get("minute")}:${get("second")}Z`,
+  );
+  return Number.isNaN(shown.getTime()) ? null : shown;
+}
+
+/**
+ * Interpret a bare ISO datetime string (no explicit offset) as if it were
+ * in the given named timezone, returning the corresponding UTC Date.
+ *
+ * Strategy: treat the requested components as a UTC instant, then iteratively
+ * refine by asking the timezone what wall-clock it shows at the current
+ * candidate and applying the residual delta. Outside DST the loop converges
+ * in one pass; across a DST boundary it converges in two. Bounded at 3
+ * iterations as a safety net.
+ *
+ * DST edge cases:
+ * - Skipped wall times (spring-forward gap, e.g. America/New_York
+ *   2024-03-10T02:30 does not exist): the loop oscillates and we return the
+ *   last candidate. In practice this lands on the post-shift (EDT) instant
+ *   for the gap.
+ * - Ambiguous wall times (fall-back, e.g. America/New_York 2024-11-03T01:30
+ *   occurs twice): the seed's first shift uses the offset at the requested
+ *   components-as-UTC, which is still EDT for the November case, so the
+ *   loop converges on the earlier (EDT) instant.
+ */
+function parseBareISOInTimezone(s: string, tz: string): Date | null {
+  const m = s.match(
+    /^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2}))?)?$/,
+  );
+  if (!m) return null;
+  const [, yr, mo, dy, hr = "00", mn = "00", sc = "00"] = m;
+  const requested = new Date(`${yr}-${mo}-${dy}T${hr}:${mn}:${sc}Z`);
+  if (Number.isNaN(requested.getTime())) return null;
+  try {
+    let candidate = requested;
+    for (let pass = 0; pass < 3; pass++) {
+      const shown = tzShownAsUtc(candidate, tz);
+      if (shown === null) return null;
+      const drift = shown.getTime() - requested.getTime();
+      if (drift === 0) return candidate;
+      candidate = new Date(candidate.getTime() - drift);
+    }
+    return candidate;
+  } catch {
+    return null;
+  }
+}
+
+function parseDate(s: string, tz?: string): Date | null {
+  // @unix-timestamp (GNU extension: date -d @1234567890)
+  // Require the entire suffix to be numeric to reject partial matches like @0abc.
+  if (s.startsWith("@")) {
+    const suffix = s.slice(1);
+    if (!/^-?\d+$/.test(suffix)) return null;
+    const seconds = Number(suffix);
+    if (!Number.isSafeInteger(seconds)) return null;
+    const date = new Date(seconds * 1000);
+    return Number.isNaN(date.getTime()) ? null : date;
+  }
+  const l = s.toLowerCase().trim();
   if (l === "now" || l === "today") return new Date();
   if (l === "yesterday") return new Date(Date.now() - 86400000);
   if (l === "tomorrow") return new Date(Date.now() + 86400000);
+  // For bare ISO strings (no explicit offset/Z), interpret in the requested timezone
+  if (tz && !/Z$/i.test(s) && !/[+-]\d{2}:?\d{2}$/.test(s)) {
+    const d = parseBareISOInTimezone(s, tz);
+    if (d) return d;
+  }
+  const d = new Date(s);
+  if (!Number.isNaN(d.getTime())) return d;
   return null;
 }
 
-export const dateCommand: Command = {
+export const dateCommand: RuntimeCommand = {
   name: "date",
-  async execute(args: string[], _ctx: CommandContext): Promise<ExecResult> {
+  async execute(
+    args: string[],
+    ctx: RuntimeCommandContext,
+  ): Promise<ExecResult> {
     if (hasHelpFlag(args)) return showHelp(dateHelp);
 
     let utc = false,
@@ -182,7 +162,22 @@ export const dateCommand: Command = {
       }
     }
 
-    const date = dateStr !== null ? parseDate(dateStr) : new Date();
+    // Display-timezone contract:
+    //   -u                  -> always UTC.
+    //   no $TZ set          -> UTC by default (sandbox non-disclosure default;
+    //                          host timezone never leaks unless caller opts in).
+    //   $TZ=<valid zone>    -> that zone (validated by isValidTimezone).
+    //   $TZ=<invalid zone>  -> UTC fallback (consistent with no-TZ default;
+    //                          avoids %Z / %z disagreeing with the displayed
+    //                          time parts).
+    // parseTz keeps its raw value (undefined when unset) so timezone-naive -d
+    // strings without $TZ fall through to JS `new Date(s)` — do NOT propagate
+    // the UTC display default into parsing.
+    let parseTz = ctx.env.get("TZ");
+    if (parseTz && !isValidTimezone(parseTz)) parseTz = undefined;
+    const displayTz = utc ? "UTC" : (parseTz ?? "UTC");
+
+    const date = dateStr !== null ? parseDate(dateStr, parseTz) : new Date();
     if (!date)
       return {
         stdout: "",
@@ -190,11 +185,36 @@ export const dateCommand: Command = {
         exitCode: 1,
       };
 
+    const ts = Math.floor(date.getTime() / 1000);
+
     let out: string;
-    if (fmt) out = formatDate(date, fmt, utc);
-    else if (iso) out = formatDate(date, "%Y-%m-%dT%H:%M:%S%z", utc);
-    else if (rfc) out = formatDate(date, "%a, %d %b %Y %H:%M:%S %z", utc);
-    else out = formatDate(date, "%a %b %e %H:%M:%S %Z %Y", utc);
+    const strftimeLimits = {
+      maxOperations: ctx.limits.maxLoopIterations,
+      maxOutputBytes:
+        Math.min(ctx.limits.maxStringLength, ctx.limits.maxOutputSize) - 1,
+    };
+    if (fmt) out = formatStrftime(fmt, ts, displayTz, strftimeLimits);
+    else if (iso)
+      out = formatStrftime(
+        "%Y-%m-%dT%H:%M:%S%z",
+        ts,
+        displayTz,
+        strftimeLimits,
+      );
+    else if (rfc)
+      out = formatStrftime(
+        "%a, %d %b %Y %H:%M:%S %z",
+        ts,
+        displayTz,
+        strftimeLimits,
+      );
+    else
+      out = formatStrftime(
+        "%a %b %e %H:%M:%S %Z %Y",
+        ts,
+        displayTz,
+        strftimeLimits,
+      );
 
     return { stdout: `${out}\n`, stderr: "", exitCode: 0 };
   },

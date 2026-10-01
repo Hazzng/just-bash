@@ -443,23 +443,42 @@ describe("Information Disclosure Prevention", () => {
     });
   });
 
+  // Default behaviour is UTC (non-disclosure of host TZ). Callers can opt in
+  // to a specific timezone by setting `$TZ` in the sandbox environment — see
+  // PR #251.
   describe("Timezone Non-Disclosure", () => {
-    it("date should not leak host timezone name", async () => {
+    it("date +%Z outputs UTC by default", async () => {
       const result = await bash.exec("date +%Z");
-      const tz = result.stdout.trim();
-      expect(tz).toBe("UTC");
-      // Must not contain slash-separated timezone like America/New_York
-      expect(tz).not.toContain("/");
+      expect(result.stdout).toBe("UTC\n");
+      expect(result.stderr).toBe("");
+      expect(result.exitCode).toBe(0);
     });
 
-    it("date should not leak host UTC offset", async () => {
+    it("date +%z outputs +0000 by default", async () => {
       const result = await bash.exec("date +%z");
-      expect(result.stdout.trim()).toBe("+0000");
+      expect(result.stdout).toBe("+0000\n");
+      expect(result.stderr).toBe("");
+      expect(result.exitCode).toBe(0);
     });
 
-    it("date default output should use UTC", async () => {
+    it("default date output contains UTC", async () => {
       const result = await bash.exec("date");
+      // Partial match is unavoidable here: default `date` output includes
+      // the current weekday/time, so we can only assert the UTC zone marker.
       expect(result.stdout).toContain("UTC");
+      expect(result.stderr).toBe("");
+      expect(result.exitCode).toBe(0);
+    });
+  });
+
+  describe("Timezone opt-in via $TZ", () => {
+    it("TZ=America/Los_Angeles date +%Z prints PST or PDT", async () => {
+      const result = await bash.exec(
+        "export TZ=America/Los_Angeles && date +%Z",
+      );
+      expect(result.stdout.trim()).toMatch(/^(PST|PDT)$/);
+      expect(result.stderr).toBe("");
+      expect(result.exitCode).toBe(0);
     });
   });
 

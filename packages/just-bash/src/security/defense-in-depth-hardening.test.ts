@@ -15,7 +15,10 @@ import {
   SecurityViolationError,
 } from "./defense-in-depth-box.js";
 
-describe("Defense-in-Depth Hardening", () => {
+const describeDefense =
+  typeof nodeModule.registerHooks === "function" ? describe : describe.skip;
+
+describeDefense("Defense-in-Depth Hardening", () => {
   beforeEach(() => {
     DefenseInDepthBox.resetInstance();
   });
@@ -484,6 +487,7 @@ describe("Defense-in-Depth Hardening", () => {
 
       handle.deactivate();
       expect(error).toBeInstanceOf(SecurityViolationError);
+      expect(error?.message).not.toContain("excludeViolationTypes");
     });
 
     it("should block Set.constructor.constructor", async () => {
@@ -826,6 +830,61 @@ describe("Defense-in-Depth Hardening", () => {
   // Category D: performance.now() blocking
   // =====================================================================
   describe("Category D: performance.now() blocking", () => {
+    it("honors main-thread violation exclusions", async () => {
+      const box = DefenseInDepthBox.getInstance({
+        excludeViolationTypes: [
+          "error_prepare_stack_trace",
+          "performance_timing",
+        ],
+      });
+      const handle = box.activate();
+      const originalPrepareStackTrace = Error.prepareStackTrace;
+
+      try {
+        let value: number | undefined;
+        await handle.run(async () => {
+          value = performance.now();
+          Error.prepareStackTrace = (_error, stackTraces) => stackTraces;
+        });
+
+        expect(typeof value).toBe("number");
+      } finally {
+        Error.prepareStackTrace = originalPrepareStackTrace;
+        handle.deactivate();
+      }
+    });
+
+    it("does not recurse through a host-wrapped Date.now()", async () => {
+      const originalDateNow = Date.now;
+      Date.now = () => {
+        performance.now();
+        return originalDateNow();
+      };
+
+      const box = DefenseInDepthBox.getInstance(true);
+      const handle = box.activate();
+
+      try {
+        let error: Error | undefined;
+        await handle.run(async () => {
+          try {
+            performance.now();
+          } catch (caught) {
+            error = caught as Error;
+          }
+        });
+
+        expect(error).toBeInstanceOf(SecurityViolationError);
+        expect(error?.message).toContain("performance");
+        expect(error?.message).toContain(
+          'add "performance_timing" to defenseInDepth.excludeViolationTypes',
+        );
+      } finally {
+        handle.deactivate();
+        Date.now = originalDateNow;
+      }
+    });
+
     it("should block performance.now() inside sandbox", async () => {
       const box = DefenseInDepthBox.getInstance(true);
       const handle = box.activate();
@@ -903,7 +962,7 @@ describe("Defense-in-Depth Hardening", () => {
       expect(error?.message).toContain("__defineSetter__");
     });
 
-    it("should freeze JSON (parse/stringify still work after freeze)", async () => {
+    it("should protect JSON while preserving parse/stringify", async () => {
       const box = DefenseInDepthBox.getInstance(true);
       const handle = box.activate();
 
@@ -917,7 +976,7 @@ describe("Defense-in-Depth Hardening", () => {
       expect(result).toEqual({ a: 1 });
     });
 
-    it("should freeze Math (floor still works after freeze)", async () => {
+    it("should protect Math while preserving floor", async () => {
       const box = DefenseInDepthBox.getInstance(true);
       const handle = box.activate();
 
@@ -1159,3 +1218,5 @@ describe("Defense-in-Depth Hardening", () => {
     });
   });
 });
+
+import * as nodeModule from "node:module";

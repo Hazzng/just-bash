@@ -10,6 +10,8 @@
  * - Escape sequences
  */
 
+import { readHeredocDelimiter } from "./parser-substitution.js";
+
 // Default max heredoc size to prevent memory exhaustion (10MB)
 const DEFAULT_MAX_HEREDOC_SIZE = 10_485_760;
 
@@ -109,6 +111,10 @@ export interface Token {
   /** For WORD tokens: quote information */
   quoted?: boolean;
   singleQuoted?: boolean;
+  /** Quote-removed value for a here-document delimiter token. */
+  heredocDelimiter?: string;
+  /** Whether a here-document content token ended at its delimiter. */
+  heredocTerminated?: boolean;
 }
 
 /**
@@ -148,6 +154,12 @@ const RESERVED_WORDS = new Map<string, TokenType>([
   ["time", TokenType.TIME],
   ["coproc", TokenType.COPROC],
 ]);
+
+const RESERVED_WORD_TOKEN_TYPES = new Set(RESERVED_WORDS.values());
+
+export function isReservedWordToken(type: TokenType): boolean {
+  return RESERVED_WORD_TOKEN_TYPES.has(type);
+}
 
 /**
  * Check if a string is a valid assignment LHS with optional nested array subscript
@@ -292,6 +304,7 @@ export class Lexer {
     stripTabs: boolean;
     quoted: boolean;
   }[] = [];
+  private pendingHeredocDelimiterMode: boolean | undefined;
   // Track depth inside (( )) for C-style for loops and arithmetic commands
   // When > 0, we're inside (( )) and need to track nested parens
   private dparenDepth = 0;
@@ -331,6 +344,10 @@ export class Lexer {
       if (token) {
         tokens.push(token);
       }
+    }
+
+    if (pendingHeredocs.length > 0) {
+      this.readHeredocContent();
     }
 
     // Add EOF token
@@ -382,6 +399,21 @@ export class Lexer {
     const c1 = input[pos + 1];
     const c2 = input[pos + 2];
 
+    const stripHeredocTabs = this.pendingHeredocDelimiterMode;
+    this.pendingHeredocDelimiterMode = undefined;
+    if (
+      stripHeredocTabs !== undefined &&
+      c0 !== "\n" &&
+      !(c0 === "#" && this.dparenDepth === 0)
+    ) {
+      return this.readHeredocDelimiterToken(
+        pos,
+        startLine,
+        startColumn,
+        stripHeredocTabs,
+      );
+    }
+
     // Comments - but NOT inside (( )) arithmetic context where # is part of base notation
     if (c0 === "#" && this.dparenDepth === 0) {
       return this.readComment(pos, startLine, startColumn);
@@ -407,7 +439,7 @@ export class Lexer {
     if (c0 === "<" && c1 === "<" && c2 === "-") {
       this.pos = pos + 3;
       this.column = startColumn + 3;
-      this.registerHeredocFromLookahead(true);
+      this.pendingHeredocDelimiterMode = true;
       return this.makeToken(
         TokenType.DLESSDASH,
         "<<-",
@@ -436,12 +468,30 @@ export class Lexer {
     if (c0 === "<" && c1 === "<") {
       this.pos = pos + 2;
       this.column = startColumn + 2;
-      this.registerHeredocFromLookahead(false);
+      this.pendingHeredocDelimiterMode = false;
       return this.makeToken(TokenType.DLESS, "<<", pos, startLine, startColumn);
     }
     // Special handling for (( and )) to track nested parentheses in arithmetic contexts
     // This is needed for C-style for loops: for (( n=0; n<(3-(1)); n++ ))
     if (c0 === "(" && c1 === "(") {
+      const previousToken = this.tokens[this.tokens.length - 1];
+      if (
+        this.dparenDepth === 0 &&
+        previousToken?.end === pos &&
+        (previousToken.type === TokenType.LESS ||
+          previousToken.type === TokenType.GREAT)
+      ) {
+        this.pos = pos + 1;
+        this.column = startColumn + 1;
+        return this.makeToken(
+          TokenType.LPAREN,
+          "(",
+          pos,
+          startLine,
+          startColumn,
+        );
+      }
+
       // If already inside arithmetic context, (( is just two open parens for grouping
       // Don't start a new arithmetic context
       if (this.dparenDepth > 0) {
@@ -1277,39 +1327,9 @@ export class Lexer {
             continue;
           }
         } else {
-          // Outside quotes, backslash escapes next character
-          // Keep the backslash for:
-          // - backslash itself (so parser can distinguish \\ from \)
-          // - quotes (so parser knows they're escaped)
-          // - glob metacharacters (so parser creates Escaped nodes that won't be glob-expanded)
-          // - parentheses (so \( and \) are treated as literal, not extglob operators)
-          // - dollar sign (so \$ in regex patterns creates Escaped("$") for literal $ matching)
-          // - dash (so \- inside character classes is literal dash, not range)
-          // - regex metacharacters (so \. \^ \+ \{ \} work in [[ =~ ]] patterns)
-          if (
-            nextChar === "\\" ||
-            nextChar === '"' ||
-            nextChar === "'" ||
-            nextChar === "`" ||
-            nextChar === "*" ||
-            nextChar === "?" ||
-            nextChar === "[" ||
-            nextChar === "]" ||
-            nextChar === "(" ||
-            nextChar === ")" ||
-            nextChar === "$" ||
-            nextChar === "-" ||
-            // Regex-specific metacharacters for [[ =~ ]] patterns
-            nextChar === "." ||
-            nextChar === "^" ||
-            nextChar === "+" ||
-            nextChar === "{" ||
-            nextChar === "}"
-          ) {
-            value += char + nextChar;
-          } else {
-            value += nextChar;
-          }
+          // Preserve the escape until word parsing so token classification can
+          // distinguish escaped text from shell syntax.
+          value += char + nextChar;
           pos += 2;
           col += 2;
           continue;
@@ -1338,11 +1358,21 @@ export class Lexer {
         let caseDepth = 0; // Track nested case statements
         let inCasePattern = false; // Are we in case pattern (after 'in', before ')')
         let wordBuffer = ""; // Track recent word for keyword detection
+        // Heredocs opened on the current line whose (literal) bodies must be
+        // skipped without quote tracking so an apostrophe in the body is not
+        // mistaken for a shell quote when finding the closing `)`.
+        const pendingHeredocs: { delim: string; stripTabs: boolean }[] = [];
         // Check if this is $((...)) arithmetic expansion
         // When $(( is followed by content that spans multiple lines and closes with ) ),
         // it's $( ( subshell ) ) not $(( arithmetic ))
         const isArithmetic =
           input[pos] === "(" && !this.dollarDparenIsSubshell(pos);
+        // Depth of arithmetic `((...))` regions. Inside one, `<<` is the
+        // left-shift operator, not a heredoc opener, so heredoc detection is
+        // suppressed. The outer `$((...))` (its first `(` was already consumed)
+        // seeds the count via `isArithmetic`; nested `$((`/`((` are picked up
+        // by the `((` detection below.
+        let arithDepth = isArithmetic ? 1 : 0;
         while (depth > 0 && pos < len) {
           const c = input[pos];
           value += c;
@@ -1360,6 +1390,100 @@ export class Lexer {
             }
           } else {
             // Not in quotes
+
+            // Track arithmetic `((...))` nesting so a left-shift `<<` inside it
+            // is not mistaken for a heredoc (which would otherwise swallow the
+            // rest of a multi-line arithmetic expansion). Only the `((`/`))`
+            // pairs are counted here; the outer `$((...))` is already seeded via
+            // `isArithmetic`.
+            if (c === "(" && input[pos + 1] === "(") {
+              arithDepth++;
+            } else if (c === ")" && input[pos + 1] === ")" && arithDepth > 0) {
+              arithDepth--;
+            }
+
+            // Heredoc operator `<<DELIM` / `<<-DELIM` (not the `<<<` here-string,
+            // whose operand stays on the same line and is quote-tracked normally,
+            // nor a `<<` left-shift inside arithmetic). The opening `<` was
+            // already appended to `value` at the top of the loop; append the
+            // rest of the operator and the delimiter, then remember the
+            // delimiter so its literal body is skipped on the next newline.
+            if (
+              arithDepth === 0 &&
+              c === "<" &&
+              input[pos + 1] === "<" &&
+              input[pos + 2] !== "<"
+            ) {
+              // Scan the operator and delimiter without mutating any state yet,
+              // so that a non-heredoc `<<` (no delimiter) falls through cleanly
+              // to the normal per-char handling rather than double-appending.
+              let p = pos + 2; // past both `<`
+              let stripTabs = false;
+              if (input[p] === "-") {
+                stripTabs = true;
+                p++;
+              }
+              while (input[p] === " " || input[p] === "\t") {
+                p++;
+              }
+              const { delim, endPos, unclosedQuote, unclosedSubstitution } =
+                readHeredocDelimiter(input, p);
+              if (unclosedQuote) {
+                throw new LexerError(
+                  `unexpected EOF while looking for matching \`${unclosedQuote}'`,
+                  ln,
+                  col,
+                );
+              }
+              if (unclosedSubstitution) {
+                throw new LexerError(
+                  "unexpected EOF while looking for matching `)'",
+                  ln,
+                  col,
+                );
+              }
+              if (delim.length > 0) {
+                // The first `<` was already appended at the top of the loop;
+                // append the rest through the delimiter and advance past all of
+                // it (including that first `<`, hence `endPos - pos`).
+                value += input.slice(pos + 1, endPos);
+                col += endPos - pos;
+                pendingHeredocs.push({ delim, stripTabs });
+                pos = endPos;
+                continue;
+              }
+            }
+
+            // Newline after one or more heredoc operators: consume their
+            // literal bodies line by line (no quote/paren tracking). The
+            // operator-line newline was already appended at the top of the loop.
+            if (c === "\n" && pendingHeredocs.length > 0) {
+              ln++;
+              col = 0;
+              let bodyPos = pos + 1;
+              for (const { delim, stripTabs } of pendingHeredocs) {
+                for (;;) {
+                  if (bodyPos >= len) break;
+                  let lineEnd = input.indexOf("\n", bodyPos);
+                  if (lineEnd === -1) lineEnd = len;
+                  const rawLine = input.slice(bodyPos, lineEnd);
+                  const cmp = stripTabs ? rawLine.replace(/^\t+/, "") : rawLine;
+                  // Append the line and its trailing newline (if present).
+                  value += input.slice(bodyPos, Math.min(lineEnd + 1, len));
+                  if (lineEnd < len) ln++;
+                  const reachedEnd = lineEnd >= len;
+                  bodyPos = lineEnd + 1;
+                  if (cmp === delim || reachedEnd) break;
+                }
+              }
+              pendingHeredocs.length = 0;
+              col = 0;
+              // `bodyPos` is `lineEnd + 1`, which overshoots to `len + 1` when
+              // the final body line has no trailing newline; clamp to `len`.
+              pos = Math.min(bodyPos, len);
+              continue;
+            }
+
             if (c === "'") {
               inSingleQuote = true;
               wordBuffer = "";
@@ -1841,21 +1965,52 @@ export class Lexer {
       const startLine = this.line;
       const startColumn = this.column;
       let content = "";
+      let terminated = false;
 
       // Read until we find the delimiter on its own line
       while (this.pos < this.input.length) {
         let line = "";
+        let continuationContent = "";
+        let lineToCheck = "";
 
-        // Read one line
-        while (this.pos < this.input.length && this.input[this.pos] !== "\n") {
-          line += this.input[this.pos];
+        // Bash removes unquoted backslash-newline continuations before matching a delimiter.
+        while (true) {
+          line = "";
+          while (
+            this.pos < this.input.length &&
+            this.input[this.pos] !== "\n"
+          ) {
+            line += this.input[this.pos];
+            this.pos++;
+            this.column++;
+          }
+
+          let trailingBackslashes = 0;
+          for (let index = line.length - 1; line[index] === "\\"; index -= 1) {
+            trailingBackslashes += 1;
+          }
+          lineToCheck += line;
+          if (
+            heredoc.quoted ||
+            trailingBackslashes % 2 === 0 ||
+            this.pos + 1 >= this.input.length
+          ) {
+            break;
+          }
+
+          lineToCheck = lineToCheck.slice(0, -1);
+          continuationContent += `${line}\n`;
           this.pos++;
-          this.column++;
+          this.line++;
+          this.column = 1;
         }
 
         // Check for delimiter
-        const lineToCheck = heredoc.stripTabs ? line.replace(/^\t+/, "") : line;
-        if (lineToCheck === heredoc.delimiter) {
+        const delimiterLine = heredoc.stripTabs
+          ? lineToCheck.replace(/^\t+/, "")
+          : lineToCheck;
+        if (delimiterLine === heredoc.delimiter) {
+          terminated = true;
           // Consume the newline
           if (this.pos < this.input.length && this.input[this.pos] === "\n") {
             this.pos++;
@@ -1865,7 +2020,17 @@ export class Lexer {
           break;
         }
 
+        content += continuationContent;
         content += line;
+        if (this.pos < this.input.length && this.input[this.pos] === "\n") {
+          content += "\n";
+          this.pos++;
+          this.line++;
+          this.column = 1;
+        } else if (line.length > 0) {
+          // Bash completes a partial final heredoc line before executing it.
+          content += "\n";
+        }
         // Check heredoc size limit to prevent memory exhaustion
         if (content.length > this.maxHeredocSize) {
           throw new LexerError(
@@ -1873,12 +2038,6 @@ export class Lexer {
             startLine,
             startColumn,
           );
-        }
-        if (this.pos < this.input.length && this.input[this.pos] === "\n") {
-          content += "\n";
-          this.pos++;
-          this.line++;
-          this.column = 1;
         }
       }
 
@@ -1889,101 +2048,70 @@ export class Lexer {
         end: this.pos,
         line: startLine,
         column: startColumn,
+        heredocTerminated: terminated,
       });
     }
   }
 
-  /**
-   * Register a here-document to be read after the next newline
-   */
-  addPendingHeredoc(
-    delimiter: string,
+  private readHeredocDelimiterToken(
+    start: number,
+    line: number,
+    column: number,
     stripTabs: boolean,
-    quoted: boolean,
-  ): void {
-    this.pendingHeredocs.push({ delimiter, stripTabs, quoted });
-  }
-
-  /**
-   * Look ahead from current position to find the here-doc delimiter
-   * and register it as a pending here-doc
-   */
-  private registerHeredocFromLookahead(stripTabs: boolean): void {
-    // Save position (we're just looking ahead, the actual tokens will be parsed later)
-    const savedPos = this.pos;
-    const savedColumn = this.column;
-
-    // Skip whitespace (but not newlines)
-    while (
-      this.pos < this.input.length &&
-      (this.input[this.pos] === " " || this.input[this.pos] === "\t")
-    ) {
-      this.pos++;
-      this.column++;
+  ): Token {
+    const input = this.input;
+    const {
+      delim: delimiter,
+      endPos,
+      quoted,
+      unclosedQuote,
+      unclosedSubstitution,
+    } = readHeredocDelimiter(input, start);
+    if (unclosedQuote) {
+      throw new LexerError(
+        `unexpected EOF while looking for matching \`${unclosedQuote}'`,
+        line,
+        column,
+      );
+    }
+    if (unclosedSubstitution) {
+      throw new LexerError(
+        "unexpected EOF while looking for matching `)'",
+        line,
+        column,
+      );
+    }
+    if (endPos === start) {
+      throw new LexerError("Expected here-document delimiter", line, column);
     }
 
-    // Read the delimiter - may be composed of multiple quoted/unquoted segments
-    // e.g., 'EOF'"2" -> EOF2, EOF -> EOF, "EOF" -> EOF
-    let delimiter = "";
-    let quoted = false;
-
-    // Keep reading segments until we hit whitespace or operator
-    while (this.pos < this.input.length) {
-      const char = this.input[this.pos];
-
-      // Stop at whitespace or operators
-      if (/[\s;<>&|()]/.test(char)) {
-        break;
-      }
-
-      if (char === "'" || char === '"') {
-        // Quoted segment - any quoting makes the whole delimiter quoted
-        quoted = true;
-        const quoteChar = char;
-        this.pos++;
-        this.column++;
-        while (
-          this.pos < this.input.length &&
-          this.input[this.pos] !== quoteChar
-        ) {
-          delimiter += this.input[this.pos];
-          this.pos++;
-          this.column++;
-        }
-        // Skip closing quote
-        if (
-          this.pos < this.input.length &&
-          this.input[this.pos] === quoteChar
-        ) {
-          this.pos++;
-          this.column++;
-        }
-      } else if (char === "\\") {
-        // Backslash escapes the next character (also makes it quoted)
-        quoted = true;
-        this.pos++;
-        this.column++;
-        if (this.pos < this.input.length) {
-          delimiter += this.input[this.pos];
-          this.pos++;
-          this.column++;
-        }
+    let currentLine = line;
+    let currentColumn = column;
+    for (let index = start; index < endPos; index++) {
+      const char = input[index];
+      if (char === "\n") {
+        currentLine += 1;
+        currentColumn = 1;
       } else {
-        // Unquoted character
-        delimiter += char;
-        this.pos++;
-        this.column++;
+        currentColumn += 1;
       }
     }
 
-    // Restore position so actual tokenization continues normally
-    this.pos = savedPos;
-    this.column = savedColumn;
+    this.pos = endPos;
+    this.line = currentLine;
+    this.column = currentColumn;
+    this.pendingHeredocs.push({ delimiter, stripTabs, quoted });
 
-    // Register the here-doc if we found a delimiter
-    if (delimiter) {
-      this.pendingHeredocs.push({ delimiter, stripTabs, quoted });
-    }
+    return {
+      type: TokenType.WORD,
+      value: input.slice(start, endPos),
+      start,
+      end: endPos,
+      line,
+      column,
+      quoted,
+      heredocDelimiter: delimiter,
+    };
   }
 
   /**

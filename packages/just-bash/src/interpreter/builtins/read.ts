@@ -2,55 +2,19 @@
  * read - Read a line of input builtin
  */
 
+import { utf8ByteLength } from "../../encoding.js";
 import type { ExecResult } from "../../types.js";
-import { clearArray } from "../helpers/array.js";
+import { ExecutionLimitError } from "../errors.js";
+import { advanceFd, getFdEntry, readFd } from "../fd-table.js";
+import { clearArray, setArrayElement } from "../helpers/array.js";
 import {
   getIfs,
   splitByIfsForRead,
   stripTrailingIfsWhitespace,
 } from "../helpers/ifs.js";
+import { checkReadonlyError } from "../helpers/readonly.js";
 import { result } from "../helpers/result.js";
 import type { InterpreterContext } from "../types.js";
-
-/**
- * Parse the content of a read-write file descriptor.
- * Format: __rw__:pathLength:path:position:content
- */
-function parseRwFdContent(fdContent: string): {
-  path: string;
-  position: number;
-  content: string;
-} | null {
-  if (!fdContent.startsWith("__rw__:")) {
-    return null;
-  }
-  const afterPrefix = fdContent.slice(7);
-  const firstColonIdx = afterPrefix.indexOf(":");
-  if (firstColonIdx === -1) return null;
-  const pathLength = Number.parseInt(afterPrefix.slice(0, firstColonIdx), 10);
-  if (Number.isNaN(pathLength) || pathLength < 0) return null;
-  const pathStart = firstColonIdx + 1;
-  const path = afterPrefix.slice(pathStart, pathStart + pathLength);
-  const positionStart = pathStart + pathLength + 1;
-  const remaining = afterPrefix.slice(positionStart);
-  const posColonIdx = remaining.indexOf(":");
-  if (posColonIdx === -1) return null;
-  const position = Number.parseInt(remaining.slice(0, posColonIdx), 10);
-  if (Number.isNaN(position) || position < 0) return null;
-  const content = remaining.slice(posColonIdx + 1);
-  return { path, position, content };
-}
-
-/**
- * Encode read-write file descriptor content.
- */
-function encodeRwFdContent(
-  path: string,
-  position: number,
-  content: string,
-): string {
-  return `__rw__:${path.length}:${path}:${position}:${content}`;
-}
 
 export function handleRead(
   ctx: InterpreterContext,
@@ -238,6 +202,19 @@ export function handleRead(
     varNames.push("REPLY");
   }
 
+  const destinations = new Set<string>();
+  if (arrayName) destinations.add(arrayName);
+  for (const name of varNames) destinations.add(name);
+  // The -N path assigns REPLY even when -a was also supplied and no explicit
+  // scalar destination was given.
+  if (ncharsExact >= 0 && varNames.length === 0) destinations.add("REPLY");
+  for (const name of destinations) {
+    if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(name)) {
+      return result("", `bash: read: \`${name}': not a valid identifier\n`, 1);
+    }
+    checkReadonlyError(ctx, name, "bash");
+  }
+
   // Note: prompt (-p) would typically output to terminal, but we ignore it in non-interactive mode
 
   // Handle -t 0: check if input is available without reading
@@ -264,16 +241,32 @@ export function handleRead(
   }
 
   // Use stdin from parameter, or fall back to groupStdin (for piped groups/while loops)
-  // If -u is specified, use the file descriptor content instead
+  // If -u is specified, read from that descriptor's shared position instead.
   let effectiveStdin = stdin;
+  // `-u 0` is just stdin, which never lives in the descriptor table.
+  // A descriptor saved off stdin (`exec 3<&0`) reads stdin too.
+  const savedStdinFd = getFdEntry(ctx, fileDescriptor);
+  const readsFromFd =
+    fileDescriptor > 0 &&
+    !(savedStdinFd?.kind === "dup-in" && savedStdinFd.sourceFd === 0);
 
-  if (fileDescriptor >= 0) {
-    // Read from specified file descriptor
-    if (ctx.state.fileDescriptors) {
-      effectiveStdin = ctx.state.fileDescriptors.get(fileDescriptor) || "";
-    } else {
-      effectiveStdin = "";
+  if (readsFromFd) {
+    const readable = readFd(ctx, fileDescriptor);
+    if ("error" in readable) {
+      // bash distinguishes "you named a descriptor that isn't open" from
+      // "the descriptor is open but not readable". stdout and stderr are
+      // always open and always write-only, so they take the latter even
+      // though they never appear in the descriptor table.
+      const writeOnly =
+        readable.error === "write-only" ||
+        fileDescriptor === 1 ||
+        fileDescriptor === 2;
+      const message = writeOnly
+        ? `bash: read: read error: ${fileDescriptor}: Bad file descriptor\n`
+        : `bash: read: ${fileDescriptor}: invalid file descriptor: Bad file descriptor\n`;
+      return result("", message, 1);
     }
+    effectiveStdin = readable.content;
   } else if (!effectiveStdin && ctx.state.groupStdin !== undefined) {
     effectiveStdin = ctx.state.groupStdin;
   }
@@ -284,32 +277,43 @@ export function handleRead(
 
   // Get input
   let line = "";
+  let lineBytes = 0;
+  const appendLine = (value: string): void => {
+    const bytes = utf8ByteLength(value);
+    if (bytes > ctx.limits.maxStringLength - lineBytes) {
+      throw new ExecutionLimitError(
+        `read: string length limit exceeded (${ctx.limits.maxStringLength} bytes)`,
+        "string_length",
+      );
+    }
+    line += value;
+    lineBytes += bytes;
+  };
+  const assertLineLimit = (value: string): void => {
+    if (utf8ByteLength(value) > ctx.limits.maxStringLength) {
+      throw new ExecutionLimitError(
+        `read: string length limit exceeded (${ctx.limits.maxStringLength} bytes)`,
+        "string_length",
+      );
+    }
+  };
   let consumed = 0;
   let foundDelimiter = true; // Assume found unless no newline at end
 
-  // Helper to consume from the appropriate source
+  // Advance whichever input this read consumed from. A descriptor carries a
+  // single shared position, so the next `read -u N` / `read <&N` continues
+  // where this one stopped.
   const consumeInput = (bytesConsumed: number) => {
-    if (fileDescriptor >= 0 && ctx.state.fileDescriptors) {
-      ctx.state.fileDescriptors.set(
-        fileDescriptor,
-        effectiveStdin.substring(bytesConsumed),
-      );
-    } else if (stdinSourceFd >= 0 && ctx.state.fileDescriptors) {
-      // Update the position of a read-write FD that was redirected to stdin
-      const fdContent = ctx.state.fileDescriptors.get(stdinSourceFd);
-      if (fdContent?.startsWith("__rw__:")) {
-        const parsed = parseRwFdContent(fdContent);
-        if (parsed) {
-          // Advance position by bytesConsumed
-          const newPosition = parsed.position + bytesConsumed;
-          ctx.state.fileDescriptors.set(
-            stdinSourceFd,
-            encodeRwFdContent(parsed.path, newPosition, parsed.content),
-          );
-        }
-      }
+    if (readsFromFd) {
+      advanceFd(ctx, fileDescriptor, bytesConsumed);
+    } else if (stdinSourceFd >= 0) {
+      // stdin came from `<&N`; move N forward by exactly what was read.
+      advanceFd(ctx, stdinSourceFd, bytesConsumed);
     } else if (ctx.state.groupStdin !== undefined && !stdin) {
       ctx.state.groupStdin = effectiveStdin.substring(bytesConsumed);
+      if (ctx.state.groupStdinSourceFd !== undefined) {
+        advanceFd(ctx, ctx.state.groupStdinSourceFd, bytesConsumed);
+      }
     }
   };
 
@@ -317,6 +321,7 @@ export function handleRead(
     // -N: Read exactly N characters (ignores delimiters, no IFS splitting)
     const toRead = Math.min(ncharsExact, effectiveStdin.length);
     line = effectiveStdin.substring(0, toRead);
+    assertLineLimit(line);
     consumed = toRead;
     foundDelimiter = toRead >= ncharsExact;
 
@@ -359,16 +364,16 @@ export function handleRead(
           // Backslash-delimiter (non-newline): counts as one char (the escaped delimiter)
           inputPos += 2;
           charCount++;
-          line += nextChar;
+          appendLine(nextChar);
           consumed = inputPos;
           continue;
         }
-        line += nextChar;
+        appendLine(nextChar);
         inputPos += 2;
         charCount++;
         consumed = inputPos;
       } else {
-        line += char;
+        appendLine(char);
         inputPos++;
         charCount++;
         consumed = inputPos;
@@ -408,19 +413,19 @@ export function handleRead(
 
         if (nextChar === effectiveDelimiter) {
           // Backslash-delimiter: escape the delimiter, include it literally
-          line += nextChar;
+          appendLine(nextChar);
           inputPos += 2;
           continue;
         }
 
         // Other backslash escapes: keep both for now (will be processed later)
-        line += char;
-        line += nextChar;
+        appendLine(char);
+        appendLine(nextChar);
         inputPos += 2;
         continue;
       }
 
-      line += char;
+      appendLine(char);
       inputPos++;
     }
 
@@ -468,26 +473,23 @@ export function handleRead(
 
   // Split by IFS (default is space, tab, newline)
   const ifs = getIfs(ctx.state.env);
+  const maxArrayElements = ctx.limits.maxArrayElements;
 
   // Handle array assignment (-a)
   if (arrayName) {
     // Pass raw flag - splitting respects backslash escapes in non-raw mode
-    const { words } = splitByIfsForRead(line, ifs, undefined, raw);
-
-    // Check array element limit
-    const maxArrayElements = ctx.limits?.maxArrayElements ?? 100000;
-    if (words.length > maxArrayElements) {
-      return result(
-        "",
-        `read: array element limit exceeded (${maxArrayElements})\n`,
-        1,
-      );
-    }
+    const { words } = splitByIfsForRead(
+      line,
+      ifs,
+      maxArrayElements,
+      undefined,
+      raw,
+    );
 
     clearArray(ctx, arrayName);
     // Assign words to array elements, processing backslash escapes after splitting
     for (let j = 0; j < words.length; j++) {
-      ctx.state.env.set(`${arrayName}_${j}`, processBackslashEscapes(words[j]));
+      setArrayElement(ctx, arrayName, j, processBackslashEscapes(words[j]));
     }
     return result("", "", foundDelimiter ? 0 : 1);
   }
@@ -495,7 +497,13 @@ export function handleRead(
   // Use the advanced IFS splitting for read with proper whitespace/non-whitespace handling
   // Pass raw flag - splitting respects backslash escapes in non-raw mode
   const maxSplit = varNames.length;
-  const { words, wordStarts } = splitByIfsForRead(line, ifs, maxSplit, raw);
+  const { words, wordStarts } = splitByIfsForRead(
+    line,
+    ifs,
+    maxArrayElements,
+    maxSplit,
+    raw,
+  );
 
   // Assign words to variables
   for (let j = 0; j < varNames.length; j++) {

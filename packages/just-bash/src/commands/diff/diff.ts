@@ -2,27 +2,43 @@
  * diff - Compare files line by line
  */
 
-import * as Diff from "diff";
 import { decodeBytesToUtf8 } from "../../encoding.js";
-import type { Command, CommandContext, ExecResult } from "../../types.js";
+import type {
+  ExecResult,
+  RuntimeCommand,
+  RuntimeCommandContext,
+} from "../../types.js";
 import { parseArgs } from "../../utils/args.js";
 import { hasHelpFlag, showHelp } from "../help.js";
+import {
+  computeChanges,
+  DEFAULT_CONTEXT,
+  formatContext,
+  formatNormal,
+  formatUnified,
+  splitLines,
+} from "./format.js";
 
 const diffHelp = {
   name: "diff",
   summary: "compare files line by line",
   usage: "diff [OPTION]... FILE1 FILE2",
   options: [
-    "-u, --unified     output unified diff format (default)",
+    "    --normal      output a normal diff (default)",
+    "-u, --unified     output a unified diff",
+    "-c, --context     output a context diff",
     "-q, --brief       report only whether files differ",
     "-s, --report-identical-files  report when files are the same",
     "-i, --ignore-case  ignore case differences",
+    "    --version     output version information and exit",
     "    --help        display this help and exit",
   ],
 };
 
 const argDefs = {
+  normal: { long: "normal", type: "boolean" as const },
   unified: { short: "u", long: "unified", type: "boolean" as const },
+  context: { short: "c", long: "context", type: "boolean" as const },
   brief: { short: "q", long: "brief", type: "boolean" as const },
   reportSame: {
     short: "s",
@@ -30,24 +46,45 @@ const argDefs = {
     type: "boolean" as const,
   },
   ignoreCase: { short: "i", long: "ignore-case", type: "boolean" as const },
+  version: { long: "version", type: "boolean" as const },
 };
 
-export const diffCommand: Command = {
+export const diffCommand: RuntimeCommand = {
   name: "diff",
 
-  async execute(args: string[], ctx: CommandContext): Promise<ExecResult> {
+  async execute(
+    args: string[],
+    ctx: RuntimeCommandContext,
+  ): Promise<ExecResult> {
     if (hasHelpFlag(args)) return showHelp(diffHelp);
 
     const parsed = parseArgs("diff", args, argDefs);
     if (!parsed.ok) return parsed.error;
 
-    const brief = parsed.result.flags.brief;
-    const reportSame = parsed.result.flags.reportSame;
-    const ignoreCase = parsed.result.flags.ignoreCase;
-    const files = parsed.result.positional;
+    const flags = parsed.result.flags;
+    if (flags.version) {
+      // No version number: this command ships inside just-bash and has no
+      // release cadence of its own, and a hard-coded package version would go
+      // stale on the very next release.
+      return { stdout: "diff (just-bash)\n", stderr: "", exitCode: 0 };
+    }
 
-    // Note: unified flag is accepted but is the default behavior
-    void parsed.result.flags.unified;
+    const styleCount =
+      Number(flags.normal) + Number(flags.unified) + Number(flags.context);
+    if (styleCount > 1) {
+      return {
+        stdout: "",
+        stderr:
+          "diff: conflicting output style options\n" +
+          "diff: Try 'diff --help' for more information.\n",
+        exitCode: 2,
+      };
+    }
+
+    const brief = flags.brief;
+    const reportSame = flags.reportSame;
+    const ignoreCase = flags.ignoreCase;
+    const files = parsed.result.positional;
 
     if (files.length < 2) {
       return { stdout: "", stderr: "diff: missing operand\n", exitCode: 2 };
@@ -84,6 +121,8 @@ export const diffCommand: Command = {
       };
     }
 
+    // Cheap whole-content equality first: -q and identical files never need
+    // the line-by-line diff.
     let t1 = c1,
       t2 = c2;
     if (ignoreCase) {
@@ -111,9 +150,33 @@ export const diffCommand: Command = {
       };
     }
 
-    const output = Diff.createTwoFilesPatch(f1, f2, c1, c2, "", "", {
-      context: 3,
-    });
+    const oldFile = splitLines(c1);
+    const newFile = splitLines(c2);
+    const changes = computeChanges(oldFile, newFile, ignoreCase);
+
+    let output: string;
+    if (flags.unified) {
+      output = formatUnified(
+        f1,
+        f2,
+        oldFile,
+        newFile,
+        changes,
+        DEFAULT_CONTEXT,
+      );
+    } else if (flags.context) {
+      output = formatContext(
+        f1,
+        f2,
+        oldFile,
+        newFile,
+        changes,
+        DEFAULT_CONTEXT,
+      );
+    } else {
+      output = formatNormal(oldFile, newFile, changes);
+    }
+
     // diff emits text; the pipeline handles encoding.
     return {
       stdout: output,
@@ -128,7 +191,9 @@ import type { CommandFuzzInfo } from "../fuzz-flags-types.js";
 export const flagsForFuzzing: CommandFuzzInfo = {
   name: "diff",
   flags: [
+    { flag: "--normal", type: "boolean" },
     { flag: "-u", type: "boolean" },
+    { flag: "-c", type: "boolean" },
     { flag: "-q", type: "boolean" },
     { flag: "-s", type: "boolean" },
     { flag: "-i", type: "boolean" },

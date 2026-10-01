@@ -2,8 +2,15 @@
  * Shared utilities for head and tail commands.
  */
 
-import { latin1FromBytes } from "../../encoding.js";
-import type { CommandContext, ExecResult } from "../../types.js";
+import { BoundedStringBuilder } from "../../bounded-builder.js";
+import {
+  encodeUtf8ToBytes,
+  latin1FromBytes,
+  readBytesFrom,
+} from "../../encoding.js";
+import { rethrowFatalExecutionError } from "../../fatal-execution-error.js";
+import { ExecutionLimitError } from "../../interpreter/errors.js";
+import type { ExecResult, RuntimeCommandContext } from "../../types.js";
 import { unknownOption } from "../help.js";
 
 export interface HeadTailOptions {
@@ -110,26 +117,39 @@ export function parseHeadTailArgs(
  * Handles stdin, multiple files, headers, and error handling.
  */
 export async function processHeadTailFiles(
-  ctx: CommandContext,
+  ctx: RuntimeCommandContext,
   options: HeadTailOptions,
   cmdName: "head" | "tail",
   contentProcessor: (content: string) => string,
 ): Promise<ExecResult> {
   const { quiet, verbose, files } = options;
+  if (files.length > ctx.limits.maxArrayElements) {
+    throw new ExecutionLimitError(
+      `${cmdName}: file operand limit exceeded (${ctx.limits.maxArrayElements})`,
+      "array_elements",
+    );
+  }
 
-  // If no files, read from stdin. head/tail are line-oriented and byte-clean
-  // — \n splits are byte-safe regardless of UTF-8 multibyte content.
+  // If no files, read from stdin. head/tail are byte-clean: `\n` splits and
+  // `-c` byte slices are byte-safe over the latin1 view, and the output is
+  // marked binary so the pipeline glue / redirects don't UTF-8 re-encode it.
   if (files.length === 0) {
     return {
       stdout: contentProcessor(latin1FromBytes(ctx.stdin)),
       stderr: "",
       exitCode: 0,
+      stdoutEncoding: "binary",
     };
   }
 
-  let stdout = "";
-  let stderr = "";
+  const maxBytes = Math.min(
+    ctx.limits.maxOutputSize,
+    ctx.limits.maxStringLength,
+  );
+  const stdout = new BoundedStringBuilder(maxBytes, cmdName);
+  const stderr = new BoundedStringBuilder(maxBytes, cmdName);
   let exitCode = 0;
+  let aggregateInput = 0;
 
   // Determine whether to show headers
   // -v always shows, -q never shows, default shows for multiple files
@@ -141,22 +161,52 @@ export async function processHeadTailFiles(
 
     try {
       const filePath = ctx.fs.resolvePath(ctx.cwd, file);
-      const content = await ctx.fs.readFile(filePath);
-
-      // Show header if needed - only after we know the file exists
-      if (showHeaders) {
-        if (filesProcessed > 0) stdout += "\n";
-        stdout += `==> ${file} <==\n`;
+      const stat = await ctx.fs.stat(filePath);
+      if (stat.size > ctx.limits.maxInputBytes - aggregateInput) {
+        throw new ExecutionLimitError(
+          `${cmdName}: aggregate input size limit exceeded (${ctx.limits.maxInputBytes} bytes)`,
+          "string_length",
+        );
       }
-      stdout += contentProcessor(content);
+      // Read the raw bytes (latin1 view) rather than `fs.readFile`'s UTF-8
+      // decode: `-c` byte counts and binary content must round-trip exactly.
+      // Matches the stdin path above and `cat`'s byte-clean behaviour.
+      const content = latin1FromBytes(await readBytesFrom(ctx.fs, filePath));
+      if (content.length > ctx.limits.maxInputBytes - aggregateInput) {
+        throw new ExecutionLimitError(
+          `${cmdName}: aggregate input size limit exceeded (${ctx.limits.maxInputBytes} bytes)`,
+          "string_length",
+        );
+      }
+      aggregateInput += content.length;
+      ctx.executionScope?.consumeInput(content.length, cmdName);
+
+      // Show header if needed - only after we know the file exists.
+      // The whole result is marked binary, so the redirect/pipe glue writes
+      // each char of `stdout` as one latin1 byte. The header text (which
+      // includes the filename) is JS Unicode, so UTF-8 encode it to its
+      // byte-shaped form first; otherwise a non-ASCII filename like
+      // `café.txt` would be written as latin1 (`é` -> 0xE9) instead of
+      // UTF-8 (`é` -> 0xC3 0xA9), corrupting the header on redirect.
+      if (showHeaders) {
+        if (filesProcessed > 0) stdout.append("\n");
+        stdout.append(latin1FromBytes(encodeUtf8ToBytes(`==> ${file} <==\n`)));
+      }
+      stdout.append(contentProcessor(content));
       filesProcessed++;
-    } catch {
-      stderr += `${cmdName}: ${file}: No such file or directory\n`;
+    } catch (error) {
+      rethrowFatalExecutionError(error);
+      stderr.append(`${cmdName}: ${file}: No such file or directory\n`);
       exitCode = 1;
     }
   }
 
-  return { stdout, stderr, exitCode };
+  return {
+    stdout: stdout.build(),
+    stderr: stderr.build(),
+    exitCode,
+    stdoutEncoding: "binary",
+  };
 }
 
 /**
@@ -181,7 +231,7 @@ export function getHead(
     const nextNewline = content.indexOf("\n", pos);
     if (nextNewline === -1) {
       // No more newlines, rest of content is last line
-      return `${content}\n`;
+      return content;
     }
     lineCount++;
     pos = nextNewline + 1;
@@ -200,6 +250,7 @@ export function getTail(
   fromLine: boolean,
 ): string {
   if (bytes !== null) {
+    if (bytes === 0) return "";
     return content.slice(-bytes);
   }
 
@@ -212,12 +263,11 @@ export function getTail(
     let lineCount = 1;
     while (pos < len && lineCount < lines) {
       const nextNewline = content.indexOf("\n", pos);
-      if (nextNewline === -1) break;
+      if (nextNewline === -1) return "";
       lineCount++;
       pos = nextNewline + 1;
     }
-    const result = content.slice(pos);
-    return result.endsWith("\n") ? result : `${result}\n`;
+    return content.slice(pos);
   }
 
   if (lines === 0) return "";
@@ -239,6 +289,5 @@ export function getTail(
   }
 
   if (pos < 0) pos = 0;
-  const result = content.slice(pos);
-  return content[len - 1] === "\n" ? result : `${result}\n`;
+  return content.slice(pos);
 }

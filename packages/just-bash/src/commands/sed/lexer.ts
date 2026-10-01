@@ -6,6 +6,8 @@
  * depends heavily on what command is being parsed.
  */
 
+import { ExecutionLimitError } from "../../interpreter/errors.js";
+
 export enum SedTokenType {
   // Addresses
   NUMBER = "NUMBER",
@@ -70,15 +72,31 @@ export class SedLexer {
   private line = 1;
   private column = 1;
 
-  constructor(input: string) {
+  constructor(
+    input: string,
+    private readonly maxInputLength: number = 1024 * 1024,
+    private readonly maxTokens: number = 100_000,
+  ) {
     this.input = input;
   }
 
   tokenize(): SedToken[] {
+    if (this.input.length > this.maxInputLength) {
+      throw new ExecutionLimitError(
+        `sed: script size limit exceeded (${this.maxInputLength} bytes)`,
+        "string_length",
+      );
+    }
     const tokens: SedToken[] = [];
     while (this.pos < this.input.length) {
       const token = this.nextToken();
       if (token) {
+        if (tokens.length >= this.maxTokens - 1) {
+          throw new ExecutionLimitError(
+            `sed: token limit exceeded (${this.maxTokens})`,
+            "array_elements",
+          );
+        }
         tokens.push(token);
       }
     }
@@ -737,8 +755,13 @@ export class SedLexer {
     // 2. a text (GNU extension one-liner, text after space)
     // 3. a\text (backslash followed by text on same line)
 
-    let hasBackslash = false;
-    // Traditional a\ syntax: only consume backslash if followed by newline or space
+    // Skip blanks after the command
+    while (this.peek() === " " || this.peek() === "\t") {
+      this.advance();
+    }
+
+    // a\ syntax: consume backslash if followed by newline or blank. Blanks
+    // after it are part of the text (GNU). Otherwise it's an escape sequence
     if (
       this.peek() === "\\" &&
       this.pos + 1 < this.input.length &&
@@ -746,29 +769,11 @@ export class SedLexer {
         this.input[this.pos + 1] === " " ||
         this.input[this.pos + 1] === "\t")
     ) {
-      hasBackslash = true;
       this.advance();
-    }
-
-    // Skip optional space after command or backslash
-    if (this.peek() === " " || this.peek() === "\t") {
-      this.advance();
-    }
-
-    // Check for \ at start of text to preserve leading spaces (GNU extension)
-    // e.g., "a \   text" preserves "   text"
-    // Only consume backslash if followed by space, otherwise it's an escape sequence
-    if (
-      this.peek() === "\\" &&
-      this.pos + 1 < this.input.length &&
-      (this.input[this.pos + 1] === " " || this.input[this.pos + 1] === "\t")
-    ) {
-      this.advance();
-    }
-
-    // If we have backslash followed by newline, text is on next line(s)
-    if (hasBackslash && this.peek() === "\n") {
-      this.advance(); // consume newline
+      // Backslash followed by newline: text is on next line(s)
+      if (this.peek() === "\n") {
+        this.advance();
+      }
     }
 
     // Read text, handling multi-line continuation and escape sequences
@@ -788,7 +793,7 @@ export class SedLexer {
         break;
       }
 
-      // Handle escape sequences in text commands (\n, \t, \r)
+      // Handle escape sequences in text commands (\n, \t, \r, escaped blanks)
       if (ch === "\\" && this.pos + 1 < this.input.length) {
         const next = this.input[this.pos + 1];
         if (next === "n") {
@@ -805,6 +810,12 @@ export class SedLexer {
         }
         if (next === "r") {
           text += "\r";
+          this.advance();
+          this.advance();
+          continue;
+        }
+        if (next === " " || next === "\t") {
+          text += next;
           this.advance();
           this.advance();
           continue;

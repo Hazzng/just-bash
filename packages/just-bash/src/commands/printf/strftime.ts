@@ -4,6 +4,14 @@
  * Handles date/time formatting for printf's %(...)T directive.
  */
 
+import { ExecutionLimitError } from "../../interpreter/errors.js";
+import { utf8ByteLength } from "./escapes.js";
+
+interface StrftimeLimits {
+  maxOperations?: number;
+  maxOutputBytes?: number;
+}
+
 /**
  * Format a timestamp using strftime-like format string.
  */
@@ -11,27 +19,63 @@ export function formatStrftime(
   format: string,
   timestamp: number,
   tz?: string,
+  limits: StrftimeLimits = {},
 ): string {
   const date = new Date(timestamp * 1000);
+  const parts = getDatePartsInTimezone(date, tz);
 
   // Build result by replacing format directives
   let result = "";
+  let resultBytes = 0;
   let i = 0;
+  let operations = 0;
+  const directiveCache = new Map<string, string | null>();
+
+  const append = (value: string): void => {
+    const valueBytes = utf8ByteLength(value);
+    if (
+      limits.maxOutputBytes !== undefined &&
+      valueBytes > limits.maxOutputBytes - resultBytes
+    ) {
+      throw new ExecutionLimitError(
+        `strftime: output size limit exceeded (${limits.maxOutputBytes} bytes)`,
+        "output_size",
+      );
+    }
+    result += value;
+    resultBytes += valueBytes;
+  };
 
   while (i < format.length) {
+    operations++;
+    if (
+      limits.maxOperations !== undefined &&
+      operations > limits.maxOperations
+    ) {
+      throw new ExecutionLimitError(
+        `strftime: iteration limit exceeded (${limits.maxOperations})`,
+        "iterations",
+      );
+    }
     if (format[i] === "%" && i + 1 < format.length) {
       const directive = format[i + 1];
-      const formatted = formatStrftimeDirective(date, directive, tz);
+      let formatted: string | null;
+      if (directiveCache.has(directive)) {
+        formatted = directiveCache.get(directive) ?? null;
+      } else {
+        formatted = formatStrftimeDirective(date, parts, directive, tz);
+        directiveCache.set(directive, formatted);
+      }
       if (formatted !== null) {
-        result += formatted;
+        append(formatted);
         i += 2;
       } else {
         // Unknown directive, keep as-is
-        result += format[i];
+        append(format[i]);
         i++;
       }
     } else {
-      result += format[i];
+      append(format[i]);
       i++;
     }
   }
@@ -87,13 +131,20 @@ function getDatePartsInTimezone(
     ]);
     const weekdayStr = getValue("weekday");
 
+    // Use NaN-safe parsing so zero-valued fields (hour/minute/second = 0)
+    // don't incorrectly fall back to local time via the || operator.
+    const parseField = (val: string, fallback: number): number => {
+      const n = Number.parseInt(val, 10);
+      return Number.isNaN(n) ? fallback : n;
+    };
     return {
-      year: Number.parseInt(getValue("year"), 10) || date.getFullYear(),
-      month: Number.parseInt(getValue("month"), 10) || date.getMonth() + 1,
-      day: Number.parseInt(getValue("day"), 10) || date.getDate(),
-      hour: Number.parseInt(getValue("hour"), 10) || date.getHours(),
-      minute: Number.parseInt(getValue("minute"), 10) || date.getMinutes(),
-      second: Number.parseInt(getValue("second"), 10) || date.getSeconds(),
+      year: parseField(getValue("year"), date.getFullYear()),
+      month: parseField(getValue("month"), date.getMonth() + 1),
+      day: parseField(getValue("day"), date.getDate()),
+      // % 24 normalises the rare browser quirk of returning 24 for midnight
+      hour: parseField(getValue("hour"), date.getHours()) % 24,
+      minute: parseField(getValue("minute"), date.getMinutes()),
+      second: parseField(getValue("second"), date.getSeconds()),
       weekday: weekdayMap.get(weekdayStr) ?? date.getDay(),
     };
   } catch {
@@ -115,11 +166,10 @@ function getDatePartsInTimezone(
  */
 function formatStrftimeDirective(
   date: Date,
+  parts: ReturnType<typeof getDatePartsInTimezone>,
   directive: string,
   tz?: string,
 ): string | null {
-  const parts = getDatePartsInTimezone(date, tz);
-
   const pad = (n: number, width = 2): string => String(n).padStart(width, "0");
 
   const dayOfYear = getDayOfYearForParts(parts.year, parts.month, parts.day);
@@ -361,28 +411,22 @@ function getDayOfYearForParts(
 
 /**
  * Calculate week number from date parts.
+ * startDay: 0 = Sunday (%U), 1 = Monday (%W)
+ * Days before the first occurrence of startDay are week 00.
  */
 function getWeekNumberForParts(
   year: number,
   month: number,
   day: number,
-  weekday: number,
+  _weekday: number,
   startDay: number,
 ): number {
-  const dayOfYear = getDayOfYearForParts(year, month, day);
-  // Find day of week of Jan 1
-  const jan1 = new Date(year, 0, 1);
-  const jan1Weekday = jan1.getDay();
-
-  // Adjust for start day
-  const adjustedJan1 = (jan1Weekday - startDay + 7) % 7;
-  const adjustedWeekday = (weekday - startDay + 7) % 7;
-
-  // Days from start of first week
-  const daysIntoYear = dayOfYear - 1 + adjustedJan1;
-  const weekNum = Math.floor((daysIntoYear - adjustedWeekday + 7) / 7);
-
-  return weekNum;
+  const doy = getDayOfYearForParts(year, month, day);
+  const jan1dow = new Date(year, 0, 1).getDay(); // 0=Sun
+  // Day-of-year (1-based) of the first startDay on or after Jan 1
+  const firstWeekStart = 1 + ((7 + startDay - jan1dow) % 7);
+  const days = doy - firstWeekStart;
+  return days < 0 ? 0 : Math.floor(days / 7) + 1;
 }
 
 /**

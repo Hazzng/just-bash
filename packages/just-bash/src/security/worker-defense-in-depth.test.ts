@@ -1,3 +1,4 @@
+import { createRequire } from "node:module";
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { DefenseInDepthBox } from "./defense-in-depth-box.js";
 import type { SecurityViolation } from "./types.js";
@@ -5,6 +6,12 @@ import {
   WorkerDefenseInDepth,
   WorkerSecurityViolationError,
 } from "./worker-defense-in-depth.js";
+
+const hostRequire = createRequire(import.meta.url);
+const HostModule = hostRequire("node:module").Module as {
+  _load: (specifier: string) => unknown;
+  _resolveFilename: (specifier: string, parent?: unknown) => string;
+};
 
 /**
  * IMPORTANT: WorkerDefenseInDepth tests require special handling.
@@ -81,6 +88,7 @@ describe("WorkerDefenseInDepth", () => {
 
         defense.deactivate();
         expect(error).toBeInstanceOf(WorkerSecurityViolationError);
+        expect(error?.message).not.toContain("excludeViolationTypes");
       });
 
       it("should block Function() call without new", () => {
@@ -626,15 +634,21 @@ describe("WorkerDefenseInDepth", () => {
         expect(error?.message).toContain("Atomics");
       });
 
-      it("should freeze Reflect (not block it)", () => {
+      it("should freeze Reflect and expose it through a read-only proxy", () => {
         defense = new WorkerDefenseInDepth({});
 
         const result = Reflect.get({ test: 42 }, "test");
-        const isFrozen = Object.isFrozen(Reflect);
+        let mutationError: unknown;
+        try {
+          (Reflect as unknown as Record<string, unknown>).sandboxEscape = 1;
+        } catch (error) {
+          mutationError = error;
+        }
 
         defense.deactivate();
         expect(result).toBe(42);
-        expect(isFrozen).toBe(true);
+        expect(mutationError).toBeInstanceOf(WorkerSecurityViolationError);
+        expect(Object.isFrozen(Reflect)).toBe(true);
       });
     });
   });
@@ -832,6 +846,40 @@ describe("WorkerDefenseInDepth", () => {
   });
 
   describe("worker-specific behavior", () => {
+    it("blocks require and direct loader calls without consulting stack text", () => {
+      const originalPrepareStackTrace = Error.prepareStackTrace;
+      Error.prepareStackTrace = () =>
+        "node:internal/modules/cjs/loader malicious-sourceURL";
+      defense = new WorkerDefenseInDepth({});
+
+      const attempts = [
+        function maliciousLoaderFrame() {
+          return hostRequire("node:child_process");
+        },
+        function directLoad() {
+          return HostModule._load("node:child_process");
+        },
+        function directResolve() {
+          return HostModule._resolveFilename("node:child_process");
+        },
+      ];
+      const errors: unknown[] = [];
+      for (const attempt of attempts) {
+        try {
+          attempt();
+        } catch (error) {
+          errors.push(error);
+        }
+      }
+
+      defense.deactivate();
+      Error.prepareStackTrace = originalPrepareStackTrace;
+      expect(errors).toHaveLength(3);
+      expect(
+        errors.every((error) => error instanceof WorkerSecurityViolationError),
+      ).toBe(true);
+    });
+
     it("should always block (no context tracking needed)", () => {
       defense = new WorkerDefenseInDepth({});
 
@@ -863,6 +911,15 @@ describe("WorkerDefenseInDepth", () => {
   });
 
   describe("excludeViolationTypes", () => {
+    it("should reject non-excludable constructor protections", () => {
+      expect(
+        () =>
+          new WorkerDefenseInDepth({
+            excludeViolationTypes: ["function_constructor"],
+          }),
+      ).toThrow(/non-excludable "function_constructor" protection/);
+    });
+
     it("should allow excluded violation types to work normally", () => {
       defense = new WorkerDefenseInDepth({
         excludeViolationTypes: ["proxy"],
@@ -986,25 +1043,6 @@ describe("WorkerDefenseInDepth", () => {
       expect(violations.some((v) => v.type === "function_constructor")).toBe(
         true,
       );
-    });
-
-    it("should exclude function_constructor when specified", () => {
-      defense = new WorkerDefenseInDepth({
-        excludeViolationTypes: ["function_constructor"],
-      });
-
-      let result: unknown;
-      let error: Error | undefined;
-      try {
-        const fn = new Function("return 42");
-        result = fn();
-      } catch (e) {
-        error = e as Error;
-      }
-
-      defense.deactivate();
-      expect(error).toBeUndefined();
-      expect(result).toBe(42);
     });
 
     it("should exclude WebAssembly when specified", () => {

@@ -8,15 +8,22 @@ import type {
   ScriptNode,
   StatementNode,
 } from "../ast/types.js";
+import type { ExecutionScope } from "../execution-scope.js";
 import type { IFileSystem } from "../fs/interface.js";
 import type { ExecutionLimits } from "../limits.js";
 import type { SecureFetch } from "../network/index.js";
 import type {
+  CommandExecOptions,
   CommandRegistry,
   ExecResult,
   FeatureCoverageWriter,
   TraceCallback,
 } from "../types.js";
+import type { ProcessSubstitutionEntry } from "./process-substitution.js";
+
+export type InterpreterExecOptions = Omit<CommandExecOptions, "cwd"> & {
+  cwd?: string;
+};
 
 /**
  * Completion specification for a command, set by the `complete` builtin.
@@ -158,6 +165,8 @@ export interface VariableAttributeState {
 export interface LocalScopingState {
   /** Stack of local variable scopes (one Map per function call) */
   localScopes: Map<string, string | undefined>[];
+  /** Whole-array snapshots parallel to localScopes. */
+  localArrayScopes?: Map<string, ShellArray | undefined>[];
   /**
    * Tracks at which call depth each local variable was declared.
    * Used for bash-specific unset scoping behavior:
@@ -307,10 +316,40 @@ export interface ProcessState {
 export interface IOState {
   /** Stdin available for commands in compound commands (groups, subshells, while loops with piped input) */
   groupStdin?: string;
+  /** Descriptor that supplied `groupStdin`, when it has a shared position. */
+  groupStdinSourceFd?: number;
   /** File descriptors for process substitution and here-docs */
   fileDescriptors?: Map<number, string>;
+  /**
+   * Descriptors whose `fileDescriptors` value is verbatim content rather
+   * than one of the `__file__:` / `__rw__:` / `__dupout__:` markers. Kept
+   * beside the table (which is public API and must stay `Map<number,
+   * string>`) so that file content shaped like a marker is never mistaken
+   * for one. Maintained exclusively by `fd-table.ts`.
+   */
+  inputFds?: Set<number>;
+  /**
+   * Descriptors that share one open file description because of `N<&M`, and
+   * therefore share a read offset. Every member of a group maps to the same
+   * Set; descriptors with no aliases have no entry. Maintained exclusively
+   * by `fd-table.ts`.
+   */
+  fdAliases?: Map<number, Set<number>>;
+  /** Standard descriptors closed by persistent `exec N>&-` redirections. */
+  closedStandardFds?: Set<number>;
   /** Next available file descriptor for {varname}>file allocation (starts at 10) */
   nextFd?: number;
+  /**
+   * Process substitutions (`<(cmd)` / `>(cmd)`) whose backing files are still
+   * live, oldest first. Used as a stack: each command execution releases the
+   * entries its own expansion pushed.
+   */
+  processSubstitutions?: ProcessSubstitutionEntry[];
+  /**
+   * True once `/dev/fd` has been routed to a private in-memory filesystem
+   * because the supplied one refused to back a descriptor (read-only sandbox).
+   */
+  processSubstitutionFsMounted?: boolean;
 }
 
 // ============================================================================
@@ -361,6 +400,12 @@ export interface InterpreterState
   // ---- Core Environment ----
   /** Environment variables (exported to commands) - uses Map to prevent prototype pollution */
   env: Map<string, string>;
+  /**
+   * Array values live outside the scalar environment namespace.  Shell names such
+   * as `a_0` and `a__length` are valid scalar variables and must never alias an
+   * element or interpreter metadata.
+   */
+  arrays?: Map<string, ShellArray>;
   /** Current working directory */
   cwd: string;
   /** Previous directory (for `cd -`) */
@@ -369,6 +414,13 @@ export interface InterpreterState
   // ---- Execution Tracking ----
   /** Exit code of last executed command */
   lastExitCode: number;
+  /**
+   * Exit status of the most recent command substitution, or `null` when none
+   * has run since the current simple command began expanding. A command with
+   * no command word takes its status from this, not from `lastExitCode`:
+   * `x=$(exit 7)` is 7, while a plain `x=1` is 0 no matter what ran before it.
+   */
+  lastSubstitutionExitCode: number | null;
   /** Last argument of previous command, for $_ expansion */
   lastArg: string;
   /** Current line number being executed (for $LINENO) */
@@ -383,6 +435,10 @@ export interface InterpreterState
   // ---- Shell Features ----
   /** Completion specifications set by the `complete` builtin */
   completionSpecs?: Map<string, CompletionSpec>;
+  /** Default completion policy (-D), kept outside the user command namespace. */
+  defaultCompletionSpec?: CompletionSpec;
+  /** Empty-line completion policy (-E), kept outside the user command namespace. */
+  emptyCompletionSpec?: CompletionSpec;
   /** Directory stack for pushd/popd/dirs */
   directoryStack?: string[];
   /** Hash table for PATH command lookup caching */
@@ -405,25 +461,37 @@ export interface InterpreterState
   extraArgs?: string[];
 }
 
+export interface ShellArray {
+  kind: "indexed" | "associative";
+  elements: Map<string, string>;
+}
+
 export interface InterpreterContext {
   state: InterpreterState;
   fs: IFileSystem;
   commands: CommandRegistry;
   /** Execution limits configuration */
   limits: Required<ExecutionLimits>;
+  /** Shared security accounting for this top-level execution and descendants. */
+  executionScope: ExecutionScope;
   execFn: (
     script: string,
-    options?: {
-      env?: Record<string, string>;
-      cwd?: string;
-      replaceEnv?: boolean;
-      signal?: AbortSignal;
-      args?: string[];
-    },
+    options?: InterpreterExecOptions,
+    stdinAlreadyAccounted?: boolean,
   ) => Promise<ExecResult>;
   executeScript: (node: ScriptNode) => Promise<ExecResult>;
   executeStatement: (node: StatementNode) => Promise<ExecResult>;
-  executeCommand: (node: CommandNode, stdin: string) => Promise<ExecResult>;
+  /**
+   * `stdinOwned` says the caller gave this command its own fd 0, even when the
+   * content is the empty string (`f < empty-file`). Without it an empty stdin
+   * is indistinguishable from "no redirection", and the command would fall
+   * back to the enclosing shell's stdin instead of seeing EOF.
+   */
+  executeCommand: (
+    node: CommandNode,
+    stdin: string,
+    stdinOwned?: boolean,
+  ) => Promise<ExecResult>;
   /** Optional secure fetch function for network-enabled commands */
   fetch?: SecureFetch;
   /** Optional sleep function for testing with mock clocks */
@@ -448,5 +516,9 @@ export interface InterpreterContext {
    * Tool invoker hook. When present, js-exec sets up a `tools` proxy that
    * routes calls through this callback.
    */
-  invokeTool?: (path: string, argsJson: string) => Promise<string>;
+  invokeTool?: (
+    path: string,
+    argsJson: string,
+    abortSignal: AbortSignal,
+  ) => Promise<string>;
 }

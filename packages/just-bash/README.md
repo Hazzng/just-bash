@@ -51,14 +51,40 @@ await bash.exec("hello Alice"); // "Hello, Alice!\n"
 await bash.exec("echo 'test' | upper"); // "TEST\n"
 ```
 
-Custom commands receive a `CommandContext` with `fs`, `cwd`, `env`, `stdin`, and `exec` (for subcommands), and work with pipes, redirections, and all shell features.
+Custom command callbacks receive a `ResolvedCommandContext` with `fs`, `cwd`,
+`env`, `stdin`, resolved `limits`, and `exec` (for subcommands), and work with
+pipes, redirections, and all shell features. The legacy `CommandContext` remains
+available for standalone context inputs; use `createCommandContext({ fs })` when
+calling a command directly with a fully resolved context.
+
+Host-provided commands preserve the legacy trusted default whether supplied to
+the `Bash` constructor, declared through `defineCommand`, loaded lazily, or
+added later with `bash.registerCommand()`. Set `trusted: false` (or use
+`defineCommand(name, execute, { trusted: false })`) to select the restricted
+extension boundary. Trusted commands run in the embedding process and should
+never execute guest-provided JavaScript.
+
+Every invocation is bound by `maxExecutionTimeMs`. On cancellation, just-bash
+revokes the command context immediately; `maxExtensionCleanupTimeMs` only
+bounds how long it waits for the now-authority-free command promise to settle.
+A command that is still resolving, such as one whose module is loading, is
+never started and reports cancellation immediately instead.
+A late continuation cannot use `ctx.fs`, `ctx.env`, `ctx.exec`, or other context
+capabilities. Cleanup work that must run at scope closure can be registered with
+`ctx.executionScope.registerCleanup()`. A cleanup failure is returned as a
+generic exit-126 shell result rather than rejecting `Bash.exec()` or exposing
+host error details. JavaScript cannot forcibly stop arbitrary host code, so
+extensions requiring a hard guarantee against external side effects must run
+in a terminable worker or process. Tests that invoke command objects directly
+can use `createCommandContext({ fs })` to get a fully resolved context without
+duplicating internal defaults.
 
 <details>
 <summary><h2>Supported Commands</h2></summary>
 
 ### File Operations
 
-`cat`, `cp`, `file`, `ln`, `ls`, `mkdir`, `mv`, `readlink`, `rm`, `rmdir`, `split`, `stat`, `touch`, `tree`
+`cat`, `cp`, `file`, `ln`, `ls`, `mkdir`, `mktemp`, `mv`, `readlink`, `rm`, `rmdir`, `split`, `stat`, `touch`, `tree`
 
 ### Text Processing
 
@@ -82,7 +108,7 @@ Custom commands receive a `CommandContext` with `fs`, `cwd`, `env`, `stdin`, and
 
 ### Shell Utilities
 
-`alias`, `bash`, `chmod`, `clear`, `date`, `expr`, `false`, `help`, `history`, `seq`, `sh`, `sleep`, `time`, `timeout`, `true`, `unalias`, `which`, `whoami`
+`alias`, `bash`, `chmod`, `clear`, `date`, `expr`, `false`, `help`, `history`, `seq`, `sh`, `sleep`, `time`, `timeout`, `true`, `unalias`, `which`, `whoami`, `yes`
 
 ### Network
 
@@ -141,6 +167,17 @@ await env.exec("while true; do sleep 1; done", { signal: controller.signal });
 await env.exec("cat <<EOF\n  indented\nEOF", { rawScript: true });
 ```
 
+### Timezone
+
+`date` defaults to UTC (`%Z=UTC`, `%z=+0000`) regardless of the host clock, so the sandbox does not leak the host timezone. To opt into a specific zone, pass `TZ` as an initial env var:
+
+```typescript
+const bash = new Bash({ env: { TZ: "America/New_York" } });
+await bash.exec("date"); // Mon Jun  1 09:30:00 EDT 2026
+```
+
+`-u` always forces UTC; an unset or invalid `$TZ` falls back to UTC. Setting `TZ` exposes that timezone to scripts running in the sandbox, so only pass a value you are comfortable revealing — forwarding the host's real `$TZ` (e.g. `process.env.TZ`) reintroduces the disclosure that the UTC default exists to prevent.
+
 `exec()` options:
 
 | Option | Type | Description |
@@ -178,12 +215,20 @@ const env = new Bash({
 import { Bash } from "just-bash";
 import { OverlayFs } from "just-bash/fs/overlay-fs";
 
-const overlay = new OverlayFs({ root: "/path/to/project" });
+const overlay = new OverlayFs({
+  root: "/path/to/project",
+  // Copy-on-write data is bounded independently from real-file reads.
+  maxMemoryBytes: 256 * 1024 * 1024,
+});
 const env = new Bash({ fs: overlay, cwd: overlay.getMountPoint() });
 
 await env.exec("cat package.json"); // reads from disk
 await env.exec('echo "modified" > package.json'); // stays in memory
 ```
+
+`maxMemoryBytes` defaults to 1 GiB and covers aggregate files retained in the
+copy-on-write layer, including append chunks. Set it to the deployment's memory
+budget when an `OverlayFs` is reused across executions.
 
 **ReadWriteFs** - Direct read-write access to a real directory. Use this if you want the agent to be able to write to your disk:
 
@@ -198,6 +243,53 @@ await env.exec('echo "hello" > file.txt'); // writes to real filesystem
 ```
 
 Keep `ReadWriteFs` pointed at a workspace directory, not at the installed `just-bash` package or any other trusted runtime code. Guest-writable roots should stay separate from trusted code.
+
+`ReadWriteFs` uses normal in-place filesystem operations for private regular
+files. For multiply-linked regular files, it isolates append and metadata
+changes by copying the file and replacing only the sandbox directory entry, so
+a host-created hard link cannot carry those changes beyond the configured root.
+Implicit copies are limited by `maxCopyOnWriteSize` (100 MB by default; set it
+to `0` to disable the limit). Overwrite does not need to copy existing content.
+Explicit `cp` copies can be limited with the opt-in `maxCopySize` option
+(unlimited by default). The portable copy path may materialize sparse-file
+holes, so embeddings that require a disk-allocation bound should configure
+`maxCopySize`.
+
+Shared-inode isolation has a few deliberate limitations:
+
+- Append, `chmod`, and `utimes` on a multiply-linked regular file require read
+  access to the file and write access to its parent directory. They fail with
+  `EFBIG` when the file exceeds `maxCopyOnWriteSize`.
+- Copies use `O_NOATIME` when the Node.js runtime exposes it and retry with
+  normal read semantics if the kernel returns `EPERM`. Runtimes and platforms
+  without `O_NOATIME` may update access-time metadata visible through another
+  hard link.
+- Do not mutate a `ReadWriteFs` root concurrently through direct host filesystem
+  APIs. Node.js does not expose the descriptor-relative operations needed to
+  make pathname validation atomic against an external actor. A concurrent host
+  append to a multiply-linked file may be lost when the isolated entry is
+  replaced.
+- Mutations in overlapping `ReadWriteFs` roots are serialized within the
+  process. Unrelated roots proceed independently. The queue is not cancellable
+  or bounded, so a large mutation can delay later operations in overlapping
+  roots even if the requesting script is subsequently aborted.
+- Content writes and appends to FIFOs, sockets, devices, and other special files
+  are rejected. This avoids indefinitely occupying an overlapping-root mutation
+  slot on a blocking special-file open. Metadata operations remain supported
+  for single-link special files; multiply-linked special files are rejected
+  because they cannot be isolated without changing their file type.
+- Private-file and single-link special-file metadata operations use pathname
+  APIs to preserve normal host permission semantics. They are not atomic
+  against a trusted host actor concurrently replacing that pathname with a
+  symlink. With `allowSymlinks: false`, symlinks present during normal path
+  validation are still rejected.
+- Copying a symlink preserves whether its guest target is absolute or relative.
+  Only symlinks whose resolved targets remain inside the root are copied.
+- Regular-file copies replace the destination entry to prevent writes through
+  hard links. Existing destinations must still be writable, and their parent
+  directory must be writable so the isolated entry can be committed. Thus a
+  writable destination in a non-writable directory cannot be copied over.
+  Copying over a FIFO, socket, device, or other special entry is rejected.
 
 **MountableFs** - Mount multiple filesystems at different paths. Combines read-only and read-write filesystems into a unified namespace:
 
@@ -357,7 +449,7 @@ await env.exec('js-exec -c "console.log(API_BASE)"');
 
 `fs.readFileSync()` returns a `Buffer` by default (matching Node.js). Pass an encoding like `'utf8'` to get a string.
 
-**Note:** The `js-exec` command only exists when `javascript` is configured. It is not available in browser environments. Execution runs in a QuickJS WASM sandbox with a 64 MB memory limit and configurable timeout (default: 10s, 60s with network).
+**Note:** The `js-exec` command only exists when `javascript` is configured. It is not available in browser environments. Execution uses the `run` package's QuickJS sandbox with a 64 MB memory limit and configurable timeout (30 seconds in the default `normal` profile and 10 seconds in the opt-in `hardened` profile). Enabling network access does not extend the configured deadline.
 
 #### Tool Invocation Hook
 
@@ -371,9 +463,10 @@ const bash = new Bash({
     // argsJson: '{"a":1,"b":2}'  (or "" for no args)
     // return:   JSON-stringified result, or "" for undefined
     // throw:    propagates as a sandbox exception
-    invokeTool: async (path, argsJson) => {
+    invokeTool: async (path, argsJson, abortSignal) => {
       const args = argsJson ? JSON.parse(argsJson) : undefined;
       if (path === "math.add") {
+        abortSignal.throwIfAborted();
         return JSON.stringify({ sum: args.a + args.b });
       }
       throw new Error(`Unknown tool: ${path}`);
@@ -383,6 +476,10 @@ const bash = new Bash({
 
 await bash.exec(`js-exec -c 'console.log((await tools.math.add({a:3,b:4})).sum)'`);
 ```
+
+The `abortSignal` fires when the JavaScript execution is canceled or times
+out. Tool implementations should forward it to network requests and other
+cancelable work so effects do not outlive the sandbox execution.
 
 The hook is generic — wire any tool framework through it (raw maps, MCP,
 Anthropic tool-use, etc.). For full GraphQL / OpenAPI / MCP discovery via
@@ -422,7 +519,7 @@ await env.exec('sqlite3 :memory: "SELECT 1 + 1"');
 await env.exec('sqlite3 data.db "SELECT * FROM users"');
 ```
 
-**Note:** SQLite is not available in browser environments. Queries run in a worker thread with a configurable timeout (default: 5 seconds) to prevent runaway queries from blocking execution.
+**Note:** SQLite is not available in browser environments. Queries run in a worker thread with a configurable timeout (30 seconds in the default `normal` profile and 5 seconds in the opt-in `hardened` profile) to prevent runaway queries from blocking execution.
 
 ## AST Transform Plugins
 
@@ -539,6 +636,7 @@ Options:
 - `-c <script>` - Execute script from argument
 - `--root <path>` - Root directory (default: current directory)
 - `--cwd <path>` - Working directory in sandbox
+- `--allow-write` - Allow write operations (in memory only; read-only by default)
 - `-e, --errexit` - Exit on first error
 - `--json` - Output as JSON
 
@@ -548,10 +646,10 @@ Options:
 pnpm shell
 ```
 
-The interactive shell has full internet access by default. Disable with `--no-network`:
+The interactive shell has network access disabled by default. Enable it with `--network`:
 
 ```bash
-pnpm shell --no-network
+pnpm shell --network
 ```
 
 ## Execution Protection
@@ -560,25 +658,61 @@ Bash protects against infinite loops and deep recursion with configurable limits
 
 ```typescript
 const env = new Bash({
+  // `normal` is the liberal, compatibility-oriented default. Use `hardened`
+  // for tighter untrusted-workload policy, then override individual resources.
+  executionLimitProfile: "hardened",
   executionLimits: {
     maxCallDepth: 100, // Max function recursion depth
-    maxCommandCount: 10000, // Max total commands executed
-    maxLoopIterations: 10000, // Max iterations per loop
-    maxAwkIterations: 10000, // Max iterations in awk programs
-    maxSedIterations: 10000, // Max iterations in sed scripts
+    maxCommandCount: 20000, // Shared across nested execution
+    maxSourceBytes: 8 * 1024 * 1024, // Shell source before parsing
+    maxFileSystemBytes: 256 * 1024 * 1024, // Retained default-FS data
+    maxOutputSize: 32 * 1024 * 1024, // Aggregate stdout + stderr bytes
+    maxArchiveBytes: 256 * 1024 * 1024, // Expanded archive bytes
+    maxDatabaseBytes: 128 * 1024 * 1024, // SQLite image bytes
+    maxExecutionTimeMs: 30_000, // Whole execution wall-clock deadline
+    maxExtensionCleanupTimeMs: 25, // Cancellation acknowledgement grace
   },
 });
 ```
 
-All limits have defaults. Error messages tell you which limit was hit. Increase as needed for your workload.
+All resources remain bounded by default in both profiles. Explicit values
+override the selected profile; non-negative safe integers and the legacy
+`Infinity` spelling are accepted. Infinite deadlines omit the corresponding
+platform timer rather than overflowing it; `js-exec` maps an infinite
+JavaScript deadline to `run`'s longest timeout (about 24.9 days). Invalid
+values are rejected when `Bash` is constructed. Error messages identify the
+resource that was hit.
 
 ## Security Model
+
+The Node.js package requires Node `>=20.19`.
 
 - The shell only has access to the provided filesystem.
 - All execution happens without VM isolation. This does introduce additional risk. The code base was designed to be robust against prototype-pollution attacks and other break outs to the host JS engine and filesystem.
 - There is no network access by default. When enabled, requests are checked against URL prefix allow-lists and HTTP-method allow-lists.
 - Python and JavaScript execution are off by default as they represent additional security surface.
+- `js-exec` guest code runs inside the `run` package's QuickJS/WASM realm. Its
+  primary isolation boundary is QuickJS plus the validated, bounded host
+  bridge; guest JavaScript does not execute in the Node worker realm.
 - Execution is protected against infinite loops and deep recursion with configurable limits.
+- Host-realm defense-in-depth uses the strongest scoped controls available on
+  each supported Node runtime. Where `node:module.registerHooks()` is present,
+  builtin ESM imports can also be denied only for the untrusted async context;
+  older runtimes retain best-effort scoped protection without failing existing
+  applications. It never installs a process-global deny-all loader. Query the
+  resolved capabilities with `DefenseInDepthBox.getInstance().getStatus()`.
+  Audit mode reports `level: "none"` because it records violations without
+  enforcing them.
+- Scoped defense uses reversible proxies for `Reflect`, `JSON`, and `Math` and
+  restores their host descriptors on deactivation. This is reported as
+  `intrinsicProtection: "scoped-best-effort"`: same-realm JavaScript that
+  cached an intrinsic or a mutation function before activation cannot be fully
+  revoked (including the direct `delete` operator). The separately named
+  `processLifetimeIntrinsicHardening: true` option permanently freezes those
+  objects and locks selected well-known Symbol descriptors; use it only in a
+  disposable or process-lifetime realm. Use an isolated worker/process when
+  complete protection and reversible host state are both required.
+- Node worker `resourceLimits` do not reliably cap the WebAssembly linear memory used by CPython or sql.js. Queue, deadline, file, database, bridge, and payload limits reduce exposure, but strong memory containment for these opt-in runtimes requires process/container isolation or a WASM build with a lower hard maximum.
 - Use [Vercel Sandbox](https://vercel.com/docs/vercel-sandbox) if you need a full VM with arbitrary binary execution.
 
 ## Browser Support
