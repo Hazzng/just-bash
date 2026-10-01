@@ -363,7 +363,8 @@ function globalReplace(
       result.append(input.slice(pos, match.index));
       pos = match.index;
       skipZeroLengthAtNextPos = false;
-      continue;
+      // Process the match we already found instead of searching again at the
+      // same position. This matters for sparse matches and allocating engines.
     }
 
     // Match found at current position
@@ -574,13 +575,11 @@ function executeCommand(
             );
           } else if (subCmd.global) {
             // Use custom global replace for POSIX-compliant zero-length match handling
-            const globalRegex = createUserRegex(
-              pattern,
-              `g${subCmd.ignoreCase ? "i" : ""}`,
-            );
+            // The match check used the same flags and lastIndex was reset.
+            // Reuse its matcher instead of allocating another one per line.
             state.patternSpace = globalReplace(
               state.patternSpace,
-              globalRegex,
+              regex,
               subCmd.replacement,
               (match, groups) =>
                 processReplacement(subCmd.replacement, match, groups),

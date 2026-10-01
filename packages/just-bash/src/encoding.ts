@@ -45,6 +45,7 @@ function assertConversionSize(
 
 /** Return UTF-8 byte length without allocating an encoded copy. */
 export function utf8ByteLength(value: string): number {
+  if (typeof Buffer !== "undefined") return Buffer.byteLength(value, "utf8");
   let bytes = 0;
   for (let index = 0; index < value.length; index++) {
     const code = value.charCodeAt(index);
@@ -130,7 +131,11 @@ export function encodeUtf8ToBytes(
   maxBytes: number = DEFAULT_MAX_CONVERSION_BYTES,
 ): ByteString {
   if (!s) return s as unknown as ByteString;
-  assertConversionSize(utf8ByteLength(s), maxBytes, "UTF-8 encode");
+  const byteLength = utf8ByteLength(s);
+  assertConversionSize(byteLength, maxBytes, "UTF-8 encode");
+  // ASCII already has the byte-string representation. Avoid encoding and then
+  // reconstructing an identical string on every text pipeline boundary.
+  if (byteLength === s.length) return s as unknown as ByteString;
   return stringFromBytes(utf8Encoder.encode(s)) as unknown as ByteString;
 }
 
@@ -141,10 +146,23 @@ const BYTE_STRING_CHUNK_SIZE = 8192;
 
 /** Convert bytes to a latin1-shaped string in bounded chunks. */
 function stringFromBytes(bytes: Uint8Array): string {
+  if (typeof Buffer !== "undefined") {
+    // Share only the supplied view; Buffer.from(bytes) would copy the input.
+    return Buffer.from(
+      bytes.buffer,
+      bytes.byteOffset,
+      bytes.byteLength,
+    ).toString("latin1");
+  }
   const chunks: string[] = [];
+  // Spreading a typed array expands its iterator into temporary argument
+  // storage. Reuse a bounded numeric array for the portable conversion.
+  const codes: number[] = [];
   for (let i = 0; i < bytes.length; i += BYTE_STRING_CHUNK_SIZE) {
-    const end = Math.min(i + BYTE_STRING_CHUNK_SIZE, bytes.length);
-    chunks.push(String.fromCharCode(...bytes.subarray(i, end)));
+    const length = Math.min(BYTE_STRING_CHUNK_SIZE, bytes.length - i);
+    codes.length = length;
+    for (let j = 0; j < length; j++) codes[j] = bytes[i + j];
+    chunks.push(String.fromCharCode.apply(null, codes));
   }
   return chunks.join("");
 }
