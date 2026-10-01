@@ -291,7 +291,7 @@ function _utf8Decode(bytes) {
 // because both sides become no-ops. Encoding tests MUST assert the encoded
 // constant directly.
 function _normEnc(enc) {
-  if (enc === undefined || enc === null) return 'utf8';
+  if (enc === undefined || enc === null || enc === '') return 'utf8';
   var e = String(enc).toLowerCase();
   if (e === 'utf8' || e === 'utf-8') return 'utf8';
   if (e === 'utf16le' || e === 'utf-16le' || e === 'ucs2' || e === 'ucs-2') return 'utf16le';
@@ -487,8 +487,7 @@ Buffer.byteLength = function(value, encoding) {
     }
     throw new TypeError('The "string" argument must be of type string or an instance of Buffer or ArrayBuffer. Received type ' + typeof value + ' (' + value + ')');
   }
-  var enc = _normEnc(encoding);
-  if (enc === undefined) _badEnc(encoding);
+  var enc = _normEnc(encoding) || 'utf8';
   if (enc === 'utf8')      return _utf8Encode(value).length;
   if (enc === 'utf16le')   return value.length * 2;
   if (enc === 'latin1' || enc === 'ascii') return value.length;
@@ -533,7 +532,13 @@ Buffer.prototype.copy = function(target, targetStart, sourceStart, sourceEnd) {
 Buffer.prototype.write = function(str, offset, length, encoding) {
   if (typeof offset === 'string') { encoding = offset; offset = 0; length = undefined; }
   else if (typeof length === 'string') { encoding = length; length = undefined; }
-  offset = offset | 0;
+  if (offset === undefined) offset = 0;
+  if (typeof offset !== 'number') {
+    throw new TypeError('The "offset" argument must be of type number. Received type ' + typeof offset);
+  }
+  if (!Number.isInteger(offset)) {
+    throw new RangeError('The value of "offset" is out of range. It must be an integer. Received ' + offset);
+  }
   if (offset < 0 || offset > this._data.length) {
     throw new RangeError('The value of "offset" is out of range. It must be >= 0 && <= ' + this._data.length + '. Received ' + offset);
   }
@@ -548,12 +553,23 @@ Buffer.prototype.write = function(str, offset, length, encoding) {
   else                        bytes = _b64Decode(str);
   var max = this._data.length - offset;
   if (length !== undefined) {
-    length = length | 0;
+    if (typeof length !== 'number') {
+      throw new TypeError('The "length" argument must be of type number. Received type ' + typeof length);
+    }
+    if (!Number.isInteger(length)) {
+      throw new RangeError('The value of "length" is out of range. It must be an integer. Received ' + length);
+    }
     if (length < 0 || length > this._data.length) {
       throw new RangeError('The value of "length" is out of range. It must be >= 0 && <= ' + this._data.length + '. Received ' + length);
     }
   }
   var write = Math.min(length === undefined ? max : length, bytes.length, max);
+  if (enc === 'utf8') {
+    // A continuation byte at the boundary means the preceding character is incomplete.
+    while (write > 0 && write < bytes.length && (bytes[write] & 0xC0) === 0x80) write--;
+  } else if (enc === 'utf16le') {
+    write -= write % 2;
+  }
   for (var i = 0; i < write; i++) this._data[offset + i] = bytes[i];
   return write;
 };
