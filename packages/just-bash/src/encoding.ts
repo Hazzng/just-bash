@@ -86,23 +86,30 @@ export function decodeBytesToUtf8(b: ByteString): string {
  */
 export function encodeUtf8ToBytes(s: string): ByteString {
   if (!s) return s as unknown as ByteString;
-  const bytes = utf8Encoder.encode(s);
-  let out = "";
-  for (let i = 0; i < bytes.length; i++) out += String.fromCharCode(bytes[i]);
-  return out as unknown as ByteString;
+  return stringFromBytes(utf8Encoder.encode(s)) as unknown as ByteString;
 }
 
 /** The empty `ByteString`. */
 export const EMPTY_BYTES: ByteString = "" as unknown as ByteString;
+
+const BYTE_STRING_CHUNK_SIZE = 8192;
+
+/** Convert bytes to a latin1-shaped string in bounded chunks. */
+function stringFromBytes(bytes: Uint8Array): string {
+  const chunks: string[] = [];
+  for (let i = 0; i < bytes.length; i += BYTE_STRING_CHUNK_SIZE) {
+    const end = Math.min(i + BYTE_STRING_CHUNK_SIZE, bytes.length);
+    chunks.push(String.fromCharCode(...bytes.subarray(i, end)));
+  }
+  return chunks.join("");
+}
 
 /**
  * Convert a `Uint8Array` to a `ByteString`. Each byte becomes one char.
  * The reverse is `Uint8Array.from(latin1FromBytes(b), (c) => c.charCodeAt(0))`.
  */
 export function bytesFromUint8Array(buf: Uint8Array): ByteString {
-  let out = "";
-  for (let i = 0; i < buf.length; i++) out += String.fromCharCode(buf[i]);
-  return out as unknown as ByteString;
+  return stringFromBytes(buf) as unknown as ByteString;
 }
 
 /**

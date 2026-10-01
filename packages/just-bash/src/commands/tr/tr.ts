@@ -2,6 +2,7 @@ import { decodeBytesToUtf8 } from "../../encoding.js";
 import { sanitizeErrorMessage } from "../../fs/sanitize-error.js";
 import type { Command, CommandContext, ExecResult } from "../../types.js";
 import { parseArgs } from "../../utils/args.js";
+import { createStringBuilder } from "../../utils/string-builder.js";
 import { hasHelpFlag, showHelp } from "../help.js";
 
 const trHelp = {
@@ -188,22 +189,27 @@ export const trCommand: Command = {
 
     if (deleteMode) {
       // Delete characters in set1 (or complement of set1)
+      const builder = createStringBuilder();
       for (const char of content) {
         if (!isInSet1(char)) {
-          output += char;
+          builder.append(char);
         }
       }
+      output = builder.finish();
     } else if (squeezeMode && sets.length === 1) {
       // Squeeze consecutive characters in set1
+      const builder = createStringBuilder();
       let prev = "";
       for (const char of content) {
         if (isInSet1(char) && char === prev) {
           continue; // Skip repeated character
         }
-        output += char;
+        builder.append(char);
         prev = char;
       }
+      output = builder.finish();
     } else {
+      const builder = createStringBuilder();
       // Translate characters from set1 to set2
       if (complementMode) {
         // In complement mode, all characters NOT in set1 are translated
@@ -211,9 +217,9 @@ export const trCommand: Command = {
         const targetChar = set2.length > 0 ? set2[set2.length - 1] : "";
         for (const char of content) {
           if (!set1Raw.includes(char)) {
-            output += targetChar;
+            builder.append(targetChar);
           } else {
-            output += char;
+            builder.append(char);
           }
         }
       } else {
@@ -226,22 +232,23 @@ export const trCommand: Command = {
         }
 
         for (const char of content) {
-          output += translationMap.get(char) ?? char;
+          builder.append(translationMap.get(char) ?? char);
         }
       }
+      output = builder.finish();
 
       // If squeeze mode is also enabled, squeeze set2 characters
       if (squeezeMode) {
-        let squeezed = "";
+        const squeezed = createStringBuilder();
         let prev = "";
         for (const char of output) {
           if (set2.includes(char) && char === prev) {
             continue;
           }
-          squeezed += char;
+          squeezed.append(char);
           prev = char;
         }
-        output = squeezed;
+        output = squeezed.finish();
       }
     }
 
