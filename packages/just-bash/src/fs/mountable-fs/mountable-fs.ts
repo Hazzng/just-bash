@@ -1,8 +1,10 @@
 import { type ByteString, readBytesFrom } from "../../encoding.js";
+import { ExclusiveCreateUnsupportedError } from "../create-exclusive.js";
 import { InMemoryFs } from "../in-memory-fs/in-memory-fs.js";
 import type {
   BufferEncoding,
   CpOptions,
+  CreateExclusiveOptions,
   FileContent,
   FsStat,
   IFileSystem,
@@ -13,6 +15,8 @@ import type {
 } from "../interface.js";
 import {
   DEFAULT_DIR_MODE,
+  dirname,
+  isSameOrDescendantPath,
   joinPath,
   normalizePath,
   resolvePath,
@@ -46,6 +50,12 @@ interface MountEntry {
   mountPoint: string;
   filesystem: IFileSystem;
 }
+
+// Sync writes that InMemoryFs and OverlayFs add to IFileSystem
+type SyncWrites = Partial<{
+  mkdirSync(path: string, options?: MkdirOptions): void;
+  writeFileSync(path: string, content: string | Uint8Array): void;
+}>;
 
 /**
  * A filesystem that supports mounting other filesystems at specific paths.
@@ -414,6 +424,73 @@ export class MountableFs implements IFileSystem {
     return fs.mkdir(relativePath, options);
   }
 
+  /**
+   * Atomically create a private file or directory on the owning filesystem.
+   * Mount points are existing directories, so a create targeting one is a
+   * collision. Delegated exclusivity is only as strong as the target
+   * filesystem provides; an external implementation predating
+   * `createExclusive` reports ENOSYS so callers can pick a fallback rather
+   * than silently getting non-exclusive creation.
+   */
+  async createExclusive(
+    path: string,
+    options: CreateExclusiveOptions,
+  ): Promise<void> {
+    const normalized = normalizePath(path);
+    const syscall = options.directory ? "mkdir" : "open";
+
+    if (this.mounts.has(normalized)) {
+      throw new Error(`EEXIST: file already exists, ${syscall} '${path}'`);
+    }
+
+    const { fs, relativePath } = this.routePath(path);
+    if (!fs.createExclusive) {
+      throw new ExclusiveCreateUnsupportedError(path, syscall);
+    }
+
+    // A directory that exists only because a child is mounted under it is
+    // real to every reader — stat reports it, and writeFile creates through
+    // it because backends make parents on write. An exclusive create refuses
+    // a missing parent, so materialize the synthetic one first; otherwise
+    // `mktemp -p /mnt` fails on a path `stat` calls a directory.
+    const parent = dirname(relativePath);
+    if (
+      parent !== "/" &&
+      this.getChildMountPoints(dirname(normalized)).length > 0 &&
+      !(await fs.exists(parent))
+    ) {
+      await fs.mkdir(parent, { recursive: true });
+    }
+
+    return fs.createExclusive(relativePath, options);
+  }
+
+  /**
+   * Synchronous mkdir, routed to the filesystem that owns the path.
+   * @throws Error if that filesystem has no synchronous writes
+   */
+  mkdirSync(path: string, options?: MkdirOptions): void {
+    const { fs, relativePath } = this.routePath(path);
+    const target = fs as SyncWrites;
+    if (!target.mkdirSync) {
+      throw new Error(`ENOSYS: function not implemented, mkdir '${path}'`);
+    }
+    target.mkdirSync(relativePath, options);
+  }
+
+  /**
+   * Synchronous writeFile, routed to the filesystem that owns the path.
+   * @throws Error if that filesystem has no synchronous writes
+   */
+  writeFileSync(path: string, content: string | Uint8Array): void {
+    const { fs, relativePath } = this.routePath(path);
+    const target = fs as SyncWrites;
+    if (!target.writeFileSync) {
+      throw new Error(`ENOSYS: function not implemented, write '${path}'`);
+    }
+    target.writeFileSync(relativePath, content);
+  }
+
   async readdir(path: string): Promise<string[]> {
     const normalized = normalizePath(path);
     const entries = new Set<string>();
@@ -471,6 +548,10 @@ export class MountableFs implements IFileSystem {
   }
 
   async cp(src: string, dest: string, options?: CpOptions): Promise<void> {
+    const srcStat = await this.stat(src);
+    if (srcStat.isDirectory && isSameOrDescendantPath(src, dest)) {
+      throw new Error(`EINVAL: cannot copy '${src}' into itself, '${dest}'`);
+    }
     const srcRoute = this.routePath(src);
     const destRoute = this.routePath(dest);
 
@@ -489,6 +570,10 @@ export class MountableFs implements IFileSystem {
 
   async mv(src: string, dest: string): Promise<void> {
     const normalized = normalizePath(src);
+    const srcStat = await this.stat(src);
+    if (srcStat.isDirectory && isSameOrDescendantPath(src, dest)) {
+      throw new Error(`EINVAL: cannot move '${src}' into itself, '${dest}'`);
+    }
 
     // Cannot move mount points
     if (this.mounts.has(normalized)) {

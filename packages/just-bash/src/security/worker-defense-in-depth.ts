@@ -43,19 +43,31 @@
  * is not needed (and would require require('node:module') which is blocked).
  */
 
-import { type BlockedGlobal, getBlockedGlobals } from "./blocked-globals.js";
+import {
+  type BlockedGlobal,
+  getBlockedGlobals,
+  getBlockedGlobalViolationTypes,
+} from "./blocked-globals.js";
+import { getSafeTimestamp } from "./safe-timestamp.js";
 import type {
   DefenseInDepthConfig,
   SecurityViolation,
   SecurityViolationType,
 } from "./types.js";
+import {
+  assertExcludableViolationTypes,
+  formatViolationErrorMessage,
+} from "./violation-error-message.js";
 
-/**
- * Suffix added to all security violation messages.
- */
-const DEFENSE_IN_DEPTH_NOTICE =
-  "\n\nThis is a defense-in-depth measure and indicates a bug in just-bash. " +
-  "Please report this at security@vercel.com";
+const WORKER_SPECIAL_EXCLUDABLE_VIOLATION_TYPES =
+  new Set<SecurityViolationType>([
+    "error_prepare_stack_trace" as const,
+    "module_load" as const,
+    "module_resolve_filename" as const,
+    "process_main_module" as const,
+    "process_exec_path" as const,
+    "process_connected" as const,
+  ]);
 
 /**
  * Error thrown when a security violation is detected.
@@ -65,7 +77,14 @@ export class WorkerSecurityViolationError extends Error {
     message: string,
     public readonly violation: SecurityViolation,
   ) {
-    super(message + DEFENSE_IN_DEPTH_NOTICE);
+    super(
+      formatViolationErrorMessage(
+        message,
+        violation.type,
+        WORKER_SPECIAL_EXCLUDABLE_VIOLATION_TYPES.has(violation.type) ||
+          getBlockedGlobalViolationTypes().has(violation.type),
+      ),
+    );
     this.name = "WorkerSecurityViolationError";
   }
 }
@@ -84,6 +103,45 @@ export interface WorkerDefenseStats {
 
 // Maximum number of violations to store (prevent memory issues)
 const MAX_STORED_VIOLATIONS = 1000;
+
+type NodeModuleClass = Record<string, unknown>;
+type WorkerNodeModuleApi = {
+  Module?: NodeModuleClass;
+  default?: NodeModuleClass;
+};
+let nodeModuleClass: NodeModuleClass | null = null;
+try {
+  const getBuiltinModule = (
+    process as typeof process & {
+      getBuiltinModule?: (specifier: string) => unknown;
+    }
+  ).getBuiltinModule;
+  const moduleApi =
+    typeof getBuiltinModule === "function"
+      ? (getBuiltinModule("module") as unknown as WorkerNodeModuleApi)
+      : typeof require === "function"
+        ? // eslint-disable-next-line @typescript-eslint/no-require-imports
+          (require("node:module") as unknown as WorkerNodeModuleApi)
+        : null;
+  nodeModuleClass = moduleApi?.Module ?? moduleApi?.default ?? null;
+  if (typeof getBuiltinModule === "function") {
+    const workerThreads = getBuiltinModule("worker_threads") as
+      | { isMainThread?: boolean }
+      | undefined;
+    const isWorkerThread = workerThreads?.isMainThread === false;
+    if (isWorkerThread) {
+      // Node initializes parts of worker message serialization lazily through
+      // node:crypto. Force that host-only bootstrap before Module methods are
+      // sealed; no guest callback is reachable during module evaluation.
+      const cryptoApi = getBuiltinModule("crypto") as
+        | { randomUUID?: () => string }
+        | undefined;
+      cryptoApi?.randomUUID?.();
+    }
+  }
+} catch {
+  nodeModuleClass = null;
+}
 
 /**
  * Generate a random execution ID for correlation.
@@ -114,6 +172,14 @@ export class WorkerDefenseInDepth {
     prop: string;
     descriptor: PropertyDescriptor | undefined;
   }> = [];
+  /**
+   * Restores the native accessor backing slot for module methods patched via
+   * their setter (see protectModuleMethod). Restoring the descriptor alone
+   * does not clear that slot, since the runtime's setter, not the descriptor
+   * shape, is what tracks the active override.
+   */
+  private moduleAccessorResets: Array<() => void> = [];
+  private patchFailures: string[] = [];
   private violations: SecurityViolation[] = [];
   private executionId: string;
 
@@ -135,6 +201,8 @@ export class WorkerDefenseInDepth {
    * @param config - Configuration for the defense layer
    */
   constructor(config: DefenseInDepthConfig) {
+    assertExcludableViolationTypes(config.excludeViolationTypes);
+
     // Capture original Proxy BEFORE any patching occurs
     // This ensures we can create blocking proxies even after patching
     this.originalProxy = Proxy;
@@ -193,8 +261,14 @@ export class WorkerDefenseInDepth {
       return;
     }
 
-    this.applyPatches();
-    this.isActivated = true;
+    try {
+      this.applyPatches();
+      this.isActivated = true;
+    } catch (error) {
+      this.restorePatches();
+      this.isActivated = false;
+      throw error;
+    }
   }
 
   /**
@@ -229,7 +303,7 @@ export class WorkerDefenseInDepth {
     message: string,
   ): SecurityViolation {
     const violation: SecurityViolation = {
-      timestamp: Date.now(),
+      timestamp: getSafeTimestamp(),
       type,
       message,
       path,
@@ -340,8 +414,12 @@ export class WorkerDefenseInDepth {
         }
       },
       set(target, prop, value, receiver) {
+        const setValue = () =>
+          path === "process.env" && prop === "DEBUG"
+            ? Reflect.set(target, prop, value)
+            : Reflect.set(target, prop, value, receiver);
         if (self.inTrap) {
-          return Reflect.set(target, prop, value, receiver);
+          return setValue();
         }
         self.inTrap = true;
         try {
@@ -356,7 +434,7 @@ export class WorkerDefenseInDepth {
           if (!auditMode) {
             throw new WorkerSecurityViolationError(message, violation);
           }
-          return Reflect.set(target, prop, value, receiver);
+          return setValue();
         } finally {
           self.inTrap = false;
         }
@@ -486,16 +564,76 @@ export class WorkerDefenseInDepth {
     }) as T;
   }
 
+  private createReadonlyObjectProxy<T extends object>(
+    original: T,
+    path: string,
+    violationType: SecurityViolationType,
+  ): T {
+    const auditMode = this.config.auditMode;
+    const allowOrThrow = (operation: string): void => {
+      const message = `${path} ${operation} is blocked in worker context`;
+      const violation = this.recordViolation(violationType, path, message);
+      if (!auditMode) {
+        throw new WorkerSecurityViolationError(message, violation);
+      }
+    };
+
+    // @banned-pattern-ignore: intentional Proxy usage for reversible security blocking
+    return new this.originalProxy(original, {
+      set(target, prop, value, receiver) {
+        allowOrThrow("modification");
+        return Reflect.set(target, prop, value, receiver);
+      },
+      defineProperty(target, prop, descriptor) {
+        allowOrThrow("defineProperty");
+        return Reflect.defineProperty(target, prop, descriptor);
+      },
+      deleteProperty(target, prop) {
+        allowOrThrow("deletion");
+        return Reflect.deleteProperty(target, prop);
+      },
+      setPrototypeOf(target, prototype) {
+        allowOrThrow("setPrototypeOf");
+        return Reflect.setPrototypeOf(target, prototype);
+      },
+      preventExtensions(target) {
+        allowOrThrow("preventExtensions");
+        return Reflect.preventExtensions(target);
+      },
+    });
+  }
+
   /**
    * Apply security patches to dangerous globals.
    */
   private applyPatches(): void {
+    this.patchFailures = [];
     const blockedGlobals = getBlockedGlobals();
     const excludeTypes = new Set(this.config.excludeViolationTypes ?? []);
+    const workerInfrastructureListenerMethods = new Set([
+      "on",
+      "once",
+      "addListener",
+      "prependListener",
+      "prependOnceListener",
+    ]);
+    const permanentIntrinsicPatches: BlockedGlobal[] = [];
 
     for (const blocked of blockedGlobals) {
       // Skip globals that are explicitly excluded
       if (excludeTypes.has(blocked.violationType)) {
+        continue;
+      }
+      // Embedded guests cannot access the host process object, while worker
+      // bootstrap/error plumbing legitimately registers process listeners.
+      if (
+        blocked.target === process &&
+        workerInfrastructureListenerMethods.has(blocked.prop)
+      ) {
+        continue;
+      }
+      if (blocked.strategy === "freeze") {
+        permanentIntrinsicPatches.push(blocked);
         continue;
       }
       this.applyPatch(blocked);
@@ -537,13 +675,33 @@ export class WorkerDefenseInDepth {
       this.protectProcessConnected();
     }
 
-    // Lock well-known Symbol properties to prevent hijacking
-    this.lockWellKnownSymbols();
-
     // Block Proxy.revocable to prevent bypassing Proxy constructor blocking
     if (!excludeTypes.has("proxy")) {
       this.protectProxyRevocable();
     }
+
+    const criticalPaths = [
+      "Function.prototype.constructor",
+      "Module._load",
+      "Module._resolveFilename",
+    ];
+    const criticalFailures = this.patchFailures.filter((path) =>
+      criticalPaths.includes(path),
+    );
+    if (criticalFailures.length > 0) {
+      this.restorePatches();
+      throw new Error(
+        `WorkerDefenseInDepth: critical patches failed: ${criticalFailures.join(", ")}`,
+      );
+    }
+
+    // Apply worker-realm lifetime locks only after reversible critical
+    // protection has succeeded, so bootstrap failure cannot leave half-active
+    // loader/global proxies behind.
+    for (const blocked of permanentIntrinsicPatches) {
+      this.applyPatch(blocked);
+    }
+    this.lockWellKnownSymbols();
   }
 
   /**
@@ -555,8 +713,6 @@ export class WorkerDefenseInDepth {
         const desc = Object.getOwnPropertyDescriptor(obj, sym);
         if (desc?.configurable) {
           if ("value" in desc) {
-            // Data descriptors must also be non-writable, otherwise assignment
-            // can still replace the Symbol property value.
             Object.defineProperty(obj, sym, {
               ...desc,
               configurable: false,
@@ -564,7 +720,6 @@ export class WorkerDefenseInDepth {
             });
             return;
           }
-
           Object.defineProperty(obj, sym, { ...desc, configurable: false });
         }
       } catch {
@@ -615,26 +770,8 @@ export class WorkerDefenseInDepth {
       lock(proto, Symbol.toStringTag);
     }
 
-    // Freeze Error.stackTraceLimit to prevent stack trace depth manipulation.
-    // Uses configurable: true so it can be restored on deactivation.
-    try {
-      const stackDesc = Object.getOwnPropertyDescriptor(
-        Error,
-        "stackTraceLimit",
-      );
-      this.originalDescriptors.push({
-        target: Error,
-        prop: "stackTraceLimit",
-        descriptor: stackDesc,
-      });
-      Object.defineProperty(Error, "stackTraceLimit", {
-        value: Error.stackTraceLimit,
-        writable: false,
-        configurable: true,
-      });
-    } catch {
-      /* best-effort */
-    }
+    // These symbol descriptors are intentionally permanent within the worker
+    // realm. Error.stackTraceLimit is diagnostic and remains host-managed.
   }
 
   /**
@@ -916,7 +1053,7 @@ export class WorkerDefenseInDepth {
         configurable: true,
       });
     } catch {
-      // Could not patch constructor
+      this.patchFailures.push(path);
     }
   }
 
@@ -1144,66 +1281,7 @@ export class WorkerDefenseInDepth {
    * We access the Module class and replace _load with a blocking proxy.
    */
   private protectModuleLoad(): void {
-    const self = this;
-    const auditMode = this.config.auditMode;
-
-    try {
-      let ModuleClass: Record<string, unknown> | null = null;
-
-      // Path 1: via process.mainModule (CJS contexts)
-      if (typeof process !== "undefined") {
-        const mainModule = (process as unknown as Record<string, unknown>)
-          .mainModule;
-        if (mainModule && typeof mainModule === "object") {
-          ModuleClass = (mainModule as unknown as Record<string, unknown>)
-            .constructor as unknown as Record<string, unknown>;
-        }
-      }
-
-      // Path 2: via require.main (CJS contexts)
-      if (
-        !ModuleClass &&
-        typeof require !== "undefined" &&
-        typeof require.main !== "undefined"
-      ) {
-        ModuleClass = (require.main as unknown as Record<string, unknown>)
-          .constructor as unknown as Record<string, unknown>;
-      }
-
-      if (!ModuleClass || typeof ModuleClass._load !== "function") {
-        return;
-      }
-
-      const original = ModuleClass._load as (...args: unknown[]) => unknown;
-      const descriptor = Object.getOwnPropertyDescriptor(ModuleClass, "_load");
-      this.originalDescriptors.push({
-        target: ModuleClass,
-        prop: "_load",
-        descriptor,
-      });
-
-      const path = "Module._load";
-      // @banned-pattern-ignore: intentional Proxy usage for security blocking
-      const proxy = new this.originalProxy(original, {
-        apply(_target, _thisArg, _args) {
-          const message = `${path} is blocked in worker context`;
-          const violation = self.recordViolation("module_load", path, message);
-
-          if (!auditMode) {
-            throw new WorkerSecurityViolationError(message, violation);
-          }
-          return Reflect.apply(_target, _thisArg, _args);
-        },
-      }) as typeof original;
-
-      Object.defineProperty(ModuleClass, "_load", {
-        value: proxy,
-        writable: true,
-        configurable: true,
-      });
-    } catch {
-      // Could not protect Module._load (expected in ESM contexts)
-    }
+    this.protectModuleMethod("_load", "module_load");
   }
 
   /**
@@ -1216,72 +1294,136 @@ export class WorkerDefenseInDepth {
    * in the main thread (DefenseInDepthBox.protectDynamicImport).
    */
   private protectModuleResolveFilename(): void {
+    this.protectModuleMethod("_resolveFilename", "module_resolve_filename");
+  }
+
+  private protectModuleMethod(
+    prop: "_load" | "_resolveFilename",
+    violationType: "module_load" | "module_resolve_filename",
+  ): void {
+    const path = `Module.${prop}`;
     const self = this;
     const auditMode = this.config.auditMode;
 
     try {
-      let ModuleClass: Record<string, unknown> | null = null;
-
-      if (typeof process !== "undefined") {
-        const mainModule = (process as unknown as Record<string, unknown>)
-          .mainModule;
-        if (mainModule && typeof mainModule === "object") {
-          ModuleClass = (mainModule as unknown as Record<string, unknown>)
-            .constructor as unknown as Record<string, unknown>;
-        }
+      const ModuleClass = nodeModuleClass;
+      const original = ModuleClass?.[prop];
+      if (!ModuleClass || typeof original !== "function") {
+        throw new Error("node:module Module class or method is unavailable");
+      }
+      const descriptor = Object.getOwnPropertyDescriptor(ModuleClass, prop);
+      if (!descriptor) throw new Error("method descriptor is unavailable");
+      if (descriptor.configurable === false && descriptor.writable === false) {
+        throw new Error("method is non-configurable and non-writable");
       }
 
-      if (
-        !ModuleClass &&
-        typeof require !== "undefined" &&
-        typeof require.main !== "undefined"
-      ) {
-        ModuleClass = (require.main as unknown as Record<string, unknown>)
-          .constructor as unknown as Record<string, unknown>;
-      }
+      const wrap = (fn: (...args: unknown[]) => unknown) =>
+        // @banned-pattern-ignore: intentional Proxy usage for security blocking
+        new self.originalProxy(fn, {
+          apply(target, thisArg, args) {
+            // All worker runtime dependencies must be loaded before activation.
+            // There is intentionally no stack/source/function-name allowlist:
+            // those diagnostics are guest-influenceable and ordinary require()
+            // reaches this method through the same loader frames as bootstrap.
+            const message = `${path} is blocked in worker context`;
+            const violation = self.recordViolation(
+              violationType,
+              path,
+              message,
+            );
+            if (!auditMode) {
+              throw new WorkerSecurityViolationError(message, violation);
+            }
+            return Reflect.apply(target, thisArg, args);
+          },
+        });
+      const proxy = wrap(original as (...args: unknown[]) => unknown);
 
-      if (!ModuleClass || typeof ModuleClass._resolveFilename !== "function") {
-        return;
-      }
-
-      const original = ModuleClass._resolveFilename as (
-        ...args: unknown[]
-      ) => unknown;
-      const descriptor = Object.getOwnPropertyDescriptor(
-        ModuleClass,
-        "_resolveFilename",
-      );
       this.originalDescriptors.push({
         target: ModuleClass,
-        prop: "_resolveFilename",
+        prop,
         descriptor,
       });
 
-      const path = "Module._resolveFilename";
-      // @banned-pattern-ignore: intentional Proxy usage for security blocking
-      const proxy = new this.originalProxy(original, {
-        apply(_target, _thisArg, _args) {
-          const message = `${path} is blocked in worker context`;
-          const violation = self.recordViolation(
-            "module_resolve_filename",
-            path,
-            message,
+      if ("value" in descriptor) {
+        Object.defineProperty(ModuleClass, prop, {
+          ...descriptor,
+          value: proxy,
+        });
+
+        const installed = Object.getOwnPropertyDescriptor(ModuleClass, prop);
+        if (ModuleClass[prop] !== proxy || installed?.value !== proxy) {
+          throw new Error("installed patch failed verification");
+        }
+      } else {
+        // Bun's loader reads a native override slot. Install through the
+        // original setter so both native dispatch and JS reads are protected.
+        const originalGet = descriptor.get;
+        const originalSet = descriptor.set;
+        if (typeof originalSet !== "function") {
+          throw new Error(
+            "accessor has no setter to install protection through",
           );
+        }
 
-          if (!auditMode) {
-            throw new WorkerSecurityViolationError(message, violation);
+        // Register rollback before calling host code, which may mutate then throw.
+        this.moduleAccessorResets.push(() => {
+          originalSet.call(ModuleClass, original);
+        });
+
+        const guardedDescriptor: PropertyDescriptor = {
+          configurable: descriptor.configurable,
+          enumerable: descriptor.enumerable,
+          get: originalGet,
+          set: (next: unknown) => {
+            // Setting must be gated exactly like calling the method is:
+            // otherwise worker code could swap out the protected
+            // function via the host's setter instead of calling it.
+            const message = `${path} modification is blocked in worker context`;
+            const violation = self.recordViolation(
+              violationType,
+              path,
+              message,
+            );
+            if (!auditMode) {
+              throw new WorkerSecurityViolationError(message, violation);
+            }
+            const wrapped =
+              typeof next === "function"
+                ? wrap(next as (...args: unknown[]) => unknown)
+                : next;
+            const previous = originalGet?.call(ModuleClass);
+            try {
+              install(wrapped);
+            } catch (error) {
+              // A failed write must not leave a partially changed native slot.
+              install(previous);
+              throw error;
+            }
+          },
+        };
+        const install = (value: unknown) => {
+          try {
+            originalSet.call(ModuleClass, value);
+          } finally {
+            // Host setters may redefine the property, even before throwing.
+            // Reinstate the write gate before returning control to the caller.
+            Object.defineProperty(ModuleClass, prop, guardedDescriptor);
           }
-          return Reflect.apply(_target, _thisArg, _args);
-        },
-      }) as typeof original;
-
-      Object.defineProperty(ModuleClass, "_resolveFilename", {
-        value: proxy,
-        writable: true,
-        configurable: true,
-      });
+          const installed = Object.getOwnPropertyDescriptor(ModuleClass, prop);
+          if (
+            installed?.get !== guardedDescriptor.get ||
+            installed?.set !== guardedDescriptor.set ||
+            originalGet?.call(ModuleClass) !== value ||
+            ModuleClass[prop] !== value
+          ) {
+            throw new Error("installed patch failed accessor verification");
+          }
+        };
+        install(proxy);
+      }
     } catch {
-      // Could not protect Module._resolveFilename (expected in ESM contexts)
+      this.patchFailures.push(path);
     }
   }
 
@@ -1303,6 +1445,16 @@ export class WorkerDefenseInDepth {
       if (strategy === "freeze") {
         if (typeof original === "object" && original !== null) {
           Object.freeze(original);
+          const path = this.getPathForTarget(target, prop);
+          const proxy = this.createReadonlyObjectProxy(
+            original,
+            path,
+            violationType,
+          );
+          Object.defineProperty(target, prop, {
+            ...descriptor,
+            value: proxy,
+          });
         }
       } else {
         const path = this.getPathForTarget(target, prop);
@@ -1336,6 +1488,15 @@ export class WorkerDefenseInDepth {
    * Restore all original values.
    */
   private restorePatches(): void {
+    for (let i = this.moduleAccessorResets.length - 1; i >= 0; i--) {
+      try {
+        this.moduleAccessorResets[i]();
+      } catch {
+        // Could not reset the module accessor override slot
+      }
+    }
+    this.moduleAccessorResets = [];
+
     for (let i = this.originalDescriptors.length - 1; i >= 0; i--) {
       const { target, prop, descriptor } = this.originalDescriptors[i];
 

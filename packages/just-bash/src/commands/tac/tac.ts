@@ -7,11 +7,15 @@
  */
 
 import { latin1FromBytes } from "../../encoding.js";
-import type { Command, CommandContext, ExecResult } from "../../types.js";
+import type {
+  ExecResult,
+  RuntimeCommand,
+  RuntimeCommandContext,
+} from "../../types.js";
 
 async function tacExecute(
   args: string[],
-  ctx: CommandContext,
+  ctx: RuntimeCommandContext,
 ): Promise<ExecResult> {
   if (args.length > 0 && args[0] !== "-") {
     // Try to read from file
@@ -37,7 +41,9 @@ async function tacExecute(
     }
   }
 
-  // Read from stdin. tac is byte-clean — splits on \n then reverses.
+  // Read from stdin. tac is byte-clean — splits on \n then reverses, so the
+  // stdin path forwards the original latin1 bytes and must be marked "bytes"
+  // (the file path above reads decoded text and stays text-shaped).
   const lines = latin1FromBytes(ctx.stdin).split("\n");
   if (lines[lines.length - 1] === "") {
     lines.pop();
@@ -47,10 +53,11 @@ async function tacExecute(
     stdout: reversed.length > 0 ? `${reversed.join("\n")}\n` : "",
     stderr: "",
     exitCode: 0,
+    stdoutKind: "bytes",
   };
 }
 
-export const tac: Command = {
+export const tac: RuntimeCommand = {
   name: "tac",
   execute: tacExecute,
 };

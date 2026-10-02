@@ -8,6 +8,8 @@
 import type { ScriptNode } from "../../ast/types.js";
 import { Parser } from "../../parser/parser.js";
 import { ExecutionLimitError, ExitError } from "../errors.js";
+import { cloneArrays } from "../helpers/array.js";
+import { recordSubstitutionExit } from "../helpers/substitution-status.js";
 import type { InterpreterContext } from "../types.js";
 import { escapeGlobChars } from "./glob-escape.js";
 
@@ -118,6 +120,7 @@ async function executeCommandSubstitutionFromString(
   const savedBashPid = ctx.state.bashPid;
   ctx.state.bashPid = ctx.state.nextVirtualPid++;
   const savedEnv = new Map(ctx.state.env);
+  const savedArrays = cloneArrays(ctx.state.arrays);
   const savedCwd = ctx.state.cwd;
   const savedSuppressVerbose = ctx.state.suppressVerbose;
   ctx.state.suppressVerbose = true;
@@ -127,10 +130,10 @@ async function executeCommandSubstitutionFromString(
     // Restore environment but preserve exit code
     const exitCode = result.exitCode;
     ctx.state.env = savedEnv;
+    ctx.state.arrays = savedArrays;
     ctx.state.cwd = savedCwd;
     ctx.state.suppressVerbose = savedSuppressVerbose;
-    ctx.state.lastExitCode = exitCode;
-    ctx.state.env.set("?", String(exitCode));
+    recordSubstitutionExit(ctx.state, exitCode);
     if (result.stderr) {
       ctx.state.expansionStderr =
         (ctx.state.expansionStderr || "") + result.stderr;
@@ -139,6 +142,7 @@ async function executeCommandSubstitutionFromString(
     return result.stdout.replace(/\n+$/, "");
   } catch (error) {
     ctx.state.env = savedEnv;
+    ctx.state.arrays = savedArrays;
     ctx.state.cwd = savedCwd;
     ctx.state.bashPid = savedBashPid;
     ctx.state.suppressVerbose = savedSuppressVerbose;
@@ -146,8 +150,7 @@ async function executeCommandSubstitutionFromString(
       throw error;
     }
     if (error instanceof ExitError) {
-      ctx.state.lastExitCode = error.exitCode;
-      ctx.state.env.set("?", String(error.exitCode));
+      recordSubstitutionExit(ctx.state, error.exitCode);
       return error.stdout?.replace(/\n+$/, "") ?? "";
     }
     return "";

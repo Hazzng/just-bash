@@ -5,6 +5,8 @@
  * you must explicitly configure allowed URLs.
  */
 
+import type { PinnedConnectionOwnerFactory } from "./dns-pin.js";
+
 /**
  * DNS lookup result used for private IP resolution checks
  */
@@ -79,7 +81,8 @@ export interface NetworkConfig {
    * - https://api.example.com/v1-admin
    * - https://api.example.com/v2/users
    * - https://api.example.org/v1/users (different origin)
-   * - URLs that rely on ambiguous encoded separators like %2f or %5c
+   * - URLs that rely on ambiguous separators or path parameters like %2f,
+   *   %5c, semicolons, or nested encodings
    *
    * Invalid entries (missing scheme, missing host, relative paths) will throw an error.
    */
@@ -117,6 +120,9 @@ export interface NetworkConfig {
    * Reject URLs with private/loopback IP addresses as hostnames.
    * Performs both lexical hostname checks and DNS resolution to catch
    * domains that resolve to private IPs (e.g., DNS rebinding attacks).
+   * Domain requests fail closed on resolution errors, empty or malformed
+   * answers, and runtimes that cannot pin the reviewed address to the actual
+   * connection. Each redirect hop is resolved and pinned independently.
    * Useful for mitigating SSRF attacks. Default: false (opt-in).
    *
    * When enabled, the private IP check is enforced even when
@@ -127,10 +133,24 @@ export interface NetworkConfig {
 
   /**
    * @internal Override DNS resolution for testing.
-   * When set, used instead of the default `dns.lookup` for the
-   * denyPrivateRanges DNS rebinding check.
+   * @deprecated guarded-fetch resolves DNS internally; `createSecureFetch`
+   * throws when this is set rather than running a weaker policy silently.
    */
   _dnsResolve?: (hostname: string) => Promise<DnsLookupResult[]>;
+
+  /**
+   * @internal Override request-owned connection binding for testing.
+   * @deprecated guarded-fetch pins connections itself; `createSecureFetch`
+   * throws when this is set rather than running a weaker policy silently.
+   */
+  _createConnectionOwner?: PinnedConnectionOwnerFactory;
+
+  /**
+   * @internal Override the HTTP transport for testing. Required to intercept
+   * requests on the private-range-enforcing path, which ignores
+   * `globalThis.fetch`. DNS resolution and IP validation still run.
+   */
+  _fetch?: typeof fetch;
 }
 
 /**
@@ -143,6 +163,16 @@ export interface FetchResult {
   /** Raw response bytes (never decoded as UTF-8 text). */
   body: Uint8Array;
   url: string;
+  /**
+   * Intermediate redirect responses in hop order (excluding the final
+   * response). Populated when redirects were followed so callers like
+   * `curl -D` can dump every status/header block the way real curl does.
+   */
+  redirectChain?: Array<{
+    status: number;
+    statusText: string;
+    headers: Record<string, string>;
+  }>;
 }
 
 /**

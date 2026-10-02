@@ -1,5 +1,5 @@
 /**
- * jq - Command-line JSON processor
+ * jq - RuntimeCommand-line JSON processor
  *
  * Full jq implementation with proper parser and evaluator.
  */
@@ -12,16 +12,23 @@ import {
   awaitWithDefenseContext,
 } from "../../security/defense-context.js";
 import { SecurityViolationError } from "../../security/defense-in-depth-box.js";
-import type { Command, CommandContext, ExecResult } from "../../types.js";
+import type {
+  ExecResult,
+  RuntimeCommand,
+  RuntimeCommandContext,
+} from "../../types.js";
 import { readFiles } from "../../utils/file-reader.js";
 import { hasHelpFlag, showHelp, unknownOption } from "../help.js";
+import { utf8ByteLength } from "../printf/escapes.js";
 import {
   type EvaluateOptions,
   evaluate,
   parse,
   type QueryValue,
 } from "../query-engine/index.js";
+import { formatJsonValue } from "../query-engine/json-output.js";
 import { sanitizeParsedData } from "../query-engine/safe-object.js";
+import { getValueDepth } from "../query-engine/value-operations.js";
 
 function escapeControlChar(char: string): string {
   switch (char) {
@@ -89,8 +96,20 @@ function parseJsonSlice(
  * Parse a JSON stream (concatenated JSON values).
  * Real jq can handle `{...}{...}` or `{...}\n{...}` or pretty-printed concatenated JSONs.
  */
-function parseJsonStream(input: string): unknown[] {
+function parseJsonStream(
+  input: string,
+  limits: { maxDepth: number; maxElements: number },
+): unknown[] {
   const results: unknown[] = [];
+  const appendResult = (value: unknown): void => {
+    if (results.length >= limits.maxElements) {
+      throw new ExecutionLimitError(
+        `query result element limit exceeded (${limits.maxElements})`,
+        "array_elements",
+      );
+    }
+    results.push(value);
+  };
   let pos = 0;
   const len = input.length;
 
@@ -104,14 +123,12 @@ function parseJsonStream(input: string): unknown[] {
 
     if (char === "{" || char === "[") {
       // Parse object or array by finding matching close bracket
-      const openBracket = char;
-      const closeBracket = char === "{" ? "}" : "]";
-      let depth = 1;
+      const bracketStack: string[] = [char === "{" ? "}" : "]"];
       let inString = false;
       let isEscaped = false;
       pos++;
 
-      while (pos < len && depth > 0) {
+      while (pos < len && bracketStack.length > 0) {
         const c = input[pos];
         if (isEscaped) {
           isEscaped = false;
@@ -120,19 +137,35 @@ function parseJsonStream(input: string): unknown[] {
         } else if (c === '"') {
           inString = !inString;
         } else if (!inString) {
-          if (c === openBracket) depth++;
-          else if (c === closeBracket) depth--;
+          if (c === "{" || c === "[") {
+            bracketStack.push(c === "{" ? "}" : "]");
+            if (bracketStack.length > limits.maxDepth) {
+              throw new ExecutionLimitError(
+                `query depth limit exceeded (${limits.maxDepth})`,
+                "recursion",
+              );
+            }
+          } else if (c === "}" || c === "]") {
+            if (bracketStack.pop() !== c) {
+              throw new Error(`Mismatched JSON delimiter at position ${pos}`);
+            }
+          }
         }
         pos++;
       }
 
-      if (depth !== 0) {
+      if (bracketStack.length !== 0) {
         throw new Error(
-          `Unexpected end of JSON input at position ${pos} (unclosed ${openBracket})`,
+          `Unexpected end of JSON input at position ${pos} (unclosed ${char})`,
         );
       }
 
-      results.push(sanitizeParsedData(parseJsonSlice(input, startPos, pos)));
+      appendResult(
+        sanitizeParsedData(parseJsonSlice(input, startPos, pos), {
+          maxDepth: limits.maxDepth,
+          maxElements: limits.maxElements,
+        }),
+      );
     } else if (char === '"') {
       // Parse string
       let isEscaped = false;
@@ -149,19 +182,23 @@ function parseJsonStream(input: string): unknown[] {
         }
         pos++;
       }
-      results.push(sanitizeParsedData(parseJsonSlice(input, startPos, pos)));
+      appendResult(
+        sanitizeParsedData(parseJsonSlice(input, startPos, pos), limits),
+      );
     } else if (char === "-" || (char >= "0" && char <= "9")) {
       // Parse number
       while (pos < len && /[\d.eE+-]/.test(input[pos])) pos++;
-      results.push(sanitizeParsedData(parseJsonSlice(input, startPos, pos)));
+      appendResult(
+        sanitizeParsedData(parseJsonSlice(input, startPos, pos), limits),
+      );
     } else if (input.slice(pos, pos + 4) === "true") {
-      results.push(true);
+      appendResult(true);
       pos += 4;
     } else if (input.slice(pos, pos + 5) === "false") {
-      results.push(false);
+      appendResult(false);
       pos += 5;
     } else if (input.slice(pos, pos + 4) === "null") {
-      results.push(null);
+      appendResult(null);
       pos += 4;
     } else {
       // Try to provide context about what we found
@@ -173,6 +210,14 @@ function parseJsonStream(input: string): unknown[] {
   }
 
   return results;
+}
+
+/**
+ * Error result for external-argument option parsing failures.
+ * jq uses exit code 2 for command-line option errors.
+ */
+function jqArgError(message: string): ExecResult {
+  return { stdout: "", stderr: `jq: ${message}\n`, exitCode: 2 };
 }
 
 const jqHelp = {
@@ -192,72 +237,23 @@ const jqHelp = {
     "-C, --color       colorize output (ignored)",
     "-M, --monochrome  monochrome output (ignored)",
     "    --tab         use tabs for indentation",
+    "    --arg NAME VALUE      bind $NAME to the string VALUE",
+    "    --argjson NAME JSON   bind $NAME to the JSON-decoded value JSON",
+    "    --rawfile NAME FILE   bind $NAME to the raw contents of FILE",
+    "    --slurpfile NAME FILE bind $NAME to the array of JSON values in FILE",
+    "    --args        remaining arguments are string positional args ($ARGS.positional)",
+    "    --jsonargs    remaining arguments are JSON positional args ($ARGS.positional)",
     "    --help        display this help and exit",
   ],
 };
 
-function formatValue(
-  v: QueryValue,
-  compact: boolean,
-  raw: boolean,
-  sortKeys: boolean,
-  useTab: boolean,
-  indent = 0,
-): string {
-  if (v === null) return "null";
-  if (v === undefined) return "null";
-  if (typeof v === "boolean") return String(v);
-  if (typeof v === "number") {
-    if (!Number.isFinite(v)) return "null";
-    return String(v);
-  }
-  if (typeof v === "string") return raw ? v : JSON.stringify(v);
-
-  const indentStr = useTab ? "\t" : "  ";
-
-  if (Array.isArray(v)) {
-    if (v.length === 0) return "[]";
-    if (compact) {
-      return `[${v.map((x) => formatValue(x, true, false, sortKeys, useTab)).join(",")}]`;
-    }
-    const items = v.map(
-      (x) =>
-        indentStr.repeat(indent + 1) +
-        formatValue(x, false, false, sortKeys, useTab, indent + 1),
-    );
-    return `[\n${items.join(",\n")}\n${indentStr.repeat(indent)}]`;
-  }
-
-  if (typeof v === "object") {
-    let keys = Object.keys(v as object);
-    if (sortKeys) keys = keys.sort();
-    if (keys.length === 0) return "{}";
-    if (compact) {
-      // @banned-pattern-ignore: iterating via Object.keys() which only returns own properties
-      return `{${keys.map((k) => `${JSON.stringify(k)}:${formatValue((v as Record<string, unknown>)[k], true, false, sortKeys, useTab)}`).join(",")}}`;
-    }
-    const items = keys.map((k) => {
-      // @banned-pattern-ignore: iterating via Object.keys() which only returns own properties
-      const val = formatValue(
-        (v as Record<string, unknown>)[k],
-        false,
-        false,
-        sortKeys,
-        useTab,
-        indent + 1,
-      );
-      return `${indentStr.repeat(indent + 1)}${JSON.stringify(k)}: ${val}`;
-    });
-    return `{\n${items.join(",\n")}\n${indentStr.repeat(indent)}}`;
-  }
-
-  return String(v);
-}
-
-export const jqCommand: Command = {
+export const jqCommand: RuntimeCommand = {
   name: "jq",
 
-  async execute(args: string[], ctx: CommandContext): Promise<ExecResult> {
+  async execute(
+    args: string[],
+    ctx: RuntimeCommandContext,
+  ): Promise<ExecResult> {
     assertDefenseContext(ctx.requireDefenseContext, "jq", "execution entry");
     const withDefenseContext = <T>(
       phase: string,
@@ -278,7 +274,19 @@ export const jqCommand: Command = {
     let useTab = false;
     let filter = ".";
     let filterSet = false;
+    let positionalMode: "none" | "args" | "jsonargs" = "none";
     const files: string[] = [];
+    const namedArgs = new Map<string, QueryValue>();
+    const positionalArgs: QueryValue[] = [];
+    const fileBindings: {
+      name: string;
+      file: string;
+      mode: "raw" | "slurp";
+    }[] = [];
+    const jsonLimits = {
+      maxDepth: ctx.limits.maxQueryDepth,
+      maxElements: ctx.limits.maxQueryElements,
+    };
 
     for (let i = 0; i < args.length; i++) {
       const a = args[i];
@@ -297,7 +305,64 @@ export const jqCommand: Command = {
       } else if (a === "-M" || a === "--monochrome") {
         /* ignored */
       } else if (a === "--tab") useTab = true;
-      else if (a === "-") files.push("-");
+      else if (a === "--arg") {
+        const name = args[i + 1];
+        const value = args[i + 2];
+        if (name === undefined || value === undefined) {
+          return jqArgError(
+            "--arg takes two parameters (e.g. --arg varname value)",
+          );
+        }
+        namedArgs.set(name, value);
+        i += 2;
+      } else if (a === "--argjson") {
+        const name = args[i + 1];
+        const json = args[i + 2];
+        if (name === undefined || json === undefined) {
+          return jqArgError(
+            "--argjson takes two parameters (e.g. --argjson varname text)",
+          );
+        }
+        let parsed: unknown[];
+        try {
+          parsed = parseJsonStream(json.trim(), jsonLimits);
+        } catch {
+          return jqArgError("invalid JSON text passed to --argjson");
+        }
+        if (parsed.length !== 1) {
+          return jqArgError("invalid JSON text passed to --argjson");
+        }
+        namedArgs.set(name, parsed[0]);
+        i += 2;
+      } else if (a === "--rawfile") {
+        const name = args[i + 1];
+        const file = args[i + 2];
+        if (name === undefined || file === undefined) {
+          return jqArgError(
+            "--rawfile takes two parameters (e.g. --rawfile varname filename)",
+          );
+        }
+        fileBindings.push({ name, file, mode: "raw" });
+        i += 2;
+      } else if (a === "--slurpfile") {
+        const name = args[i + 1];
+        const file = args[i + 2];
+        if (name === undefined || file === undefined) {
+          return jqArgError(
+            "--slurpfile takes two parameters (e.g. --slurpfile varname filename)",
+          );
+        }
+        fileBindings.push({ name, file, mode: "slurp" });
+        i += 2;
+      } else if (a === "--args") {
+        // Remaining non-option tokens (after the filter) become string
+        // positional args instead of input files.
+        positionalMode = "args";
+      } else if (a === "--jsonargs") {
+        // Remaining non-option tokens (after the filter) are JSON-parsed and
+        // become positional args instead of input files.
+        positionalMode = "jsonargs";
+      } else if (a === "-") files.push("-");
       else if (a.startsWith("--")) return unknownOption("jq", a);
       else if (a.startsWith("-")) {
         for (const c of a.slice(1)) {
@@ -318,10 +383,57 @@ export const jqCommand: Command = {
           } else return unknownOption("jq", `-${c}`);
         }
       } else if (!filterSet) {
+        // The first non-option token is always the filter, even when a
+        // positional mode has already been enabled by --args/--jsonargs.
         filter = a;
         filterSet = true;
+      } else if (positionalMode === "args") {
+        positionalArgs.push(a);
+      } else if (positionalMode === "jsonargs") {
+        let parsed: unknown[];
+        try {
+          parsed = parseJsonStream(a.trim(), jsonLimits);
+        } catch {
+          return jqArgError("invalid JSON text passed to --jsonargs");
+        }
+        if (parsed.length !== 1) {
+          return jqArgError("invalid JSON text passed to --jsonargs");
+        }
+        positionalArgs.push(parsed[0] as QueryValue);
       } else {
         files.push(a);
+      }
+    }
+
+    // Read files bound via --rawfile/--slurpfile through the shared file
+    // reader so they get the same security posture as normal input files.
+    if (fileBindings.length > 0) {
+      const result = await withDefenseContext("arg file read", () =>
+        readFiles(
+          ctx,
+          fileBindings.map((b) => b.file),
+          { cmdName: "jq", stopOnError: true },
+        ),
+      );
+      if (result.exitCode !== 0) {
+        return { stdout: "", stderr: result.stderr, exitCode: 2 };
+      }
+      for (let b = 0; b < fileBindings.length; b++) {
+        const { name, mode } = fileBindings[b];
+        const text = decodeBytesToUtf8(result.files[b].content);
+        if (mode === "raw") {
+          namedArgs.set(name, text);
+        } else {
+          const trimmed = text.trim();
+          try {
+            namedArgs.set(
+              name,
+              trimmed ? parseJsonStream(trimmed, jsonLimits) : [],
+            );
+          } catch {
+            return jqArgError("invalid JSON text passed to --slurpfile");
+          }
+        }
       }
     }
 
@@ -355,16 +467,38 @@ export const jqCommand: Command = {
     }
 
     try {
-      const ast = parse(filter);
+      const ast = parse(filter, {
+        maxDepth: ctx.limits.maxQueryDepth,
+        maxTokens: ctx.limits.maxQueryTokens,
+        maxSourceLength: ctx.limits.maxStringLength,
+      });
       let values: QueryValue[] = [];
 
       const evalOptions: EvaluateOptions = {
         limits: ctx.limits
-          ? { maxIterations: ctx.limits.maxJqIterations }
+          ? {
+              maxIterations: ctx.limits.maxJqIterations,
+              maxStringLength: ctx.limits.maxStringLength,
+              maxOutputSize: ctx.limits.maxOutputSize,
+              maxArrayElements: ctx.limits.maxQueryElements,
+              maxDepth: ctx.limits.maxQueryDepth,
+            }
           : undefined,
         env: ctx.env,
+        namedArgs,
+        positionalArgs,
         coverage: ctx.coverage,
         requireDefenseContext: ctx.requireDefenseContext,
+        budget: { operations: 0, callDepth: 0 },
+      };
+      const appendValues = (target: QueryValue[], next: QueryValue[]): void => {
+        if (next.length > ctx.limits.maxQueryElements - target.length) {
+          throw new ExecutionLimitError(
+            `query result element limit exceeded (${ctx.limits.maxQueryElements})`,
+            "array_elements",
+          );
+        }
+        for (const value of next) target.push(value);
       };
 
       if (nullInput) {
@@ -387,14 +521,17 @@ export const jqCommand: Command = {
           let start = 0;
           let nl = text.indexOf("\n", start);
           while (nl !== -1) {
-            values.push(...evaluate(text.slice(start, nl), ast, evalOptions));
+            appendValues(
+              values,
+              evaluate(text.slice(start, nl), ast, evalOptions),
+            );
             start = nl + 1;
             nl = text.indexOf("\n", start);
           }
           remainder = text.slice(start);
         }
         if (remainder !== "") {
-          values.push(...evaluate(remainder, ast, evalOptions));
+          appendValues(values, evaluate(remainder, ast, evalOptions));
         }
       } else if (slurp) {
         // Slurp mode: combine all inputs into single array
@@ -403,7 +540,7 @@ export const jqCommand: Command = {
         for (const { content } of inputs) {
           const trimmed = content.trim();
           if (trimmed) {
-            items.push(...parseJsonStream(trimmed));
+            appendValues(items, parseJsonStream(trimmed, jsonLimits));
           }
         }
         values = evaluate(items, ast, evalOptions);
@@ -414,31 +551,61 @@ export const jqCommand: Command = {
           const trimmed = content.trim();
           if (!trimmed) continue;
 
-          const jsonValues = parseJsonStream(trimmed);
+          const jsonValues = parseJsonStream(trimmed, jsonLimits);
           for (const jsonValue of jsonValues) {
-            values.push(...evaluate(jsonValue, ast, evalOptions));
+            appendValues(values, evaluate(jsonValue, ast, evalOptions));
           }
         }
       }
 
-      const formatted = values.map((v) =>
-        formatValue(v, compact, raw, sortKeys, useTab),
-      );
       const separator = joinOutput ? "" : "\n";
-      const output = formatted.join(separator);
-
-      // Check output size against limit
-      const maxStringLength = ctx.limits?.maxStringLength;
-      if (
-        maxStringLength !== undefined &&
-        maxStringLength > 0 &&
-        output.length > maxStringLength
-      ) {
-        throw new ExecutionLimitError(
-          `jq: output size limit exceeded (${maxStringLength} bytes)`,
-          "string_length",
-        );
+      const maxStringLength = Math.min(
+        ctx.limits.maxStringLength,
+        ctx.limits.maxOutputSize,
+      );
+      const formatted: string[] = [];
+      let outputBytes = 0;
+      for (const value of values) {
+        const separatorBytes = formatted.length > 0 ? separator.length : 0;
+        const finalNewlineBytes = joinOutput ? 0 : 1;
+        const remainingBytes =
+          maxStringLength - outputBytes - separatorBytes - finalNewlineBytes;
+        if (remainingBytes < 0) {
+          throw new ExecutionLimitError(
+            `output size limit exceeded (${maxStringLength} bytes)`,
+            "string_length",
+          );
+        }
+        if (
+          getValueDepth(value, ctx.limits.maxQueryDepth + 1) >
+          ctx.limits.maxQueryDepth
+        ) {
+          throw new ExecutionLimitError(
+            `query depth limit exceeded (${ctx.limits.maxQueryDepth})`,
+            "recursion",
+          );
+        }
+        const text = formatJsonValue(value, remainingBytes, {
+          compact,
+          raw,
+          sortKeys,
+          useTab,
+          limitKind: "string_length",
+        });
+        const textBytes = utf8ByteLength(text);
+        if (
+          outputBytes + separatorBytes + textBytes + finalNewlineBytes >
+          maxStringLength
+        ) {
+          throw new ExecutionLimitError(
+            `output size limit exceeded (${maxStringLength} bytes)`,
+            "string_length",
+          );
+        }
+        outputBytes += separatorBytes + textBytes;
+        formatted.push(text);
       }
+      const output = formatted.join(separator);
 
       const exitCode =
         exitStatus &&

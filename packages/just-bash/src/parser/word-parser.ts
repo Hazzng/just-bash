@@ -20,6 +20,34 @@ import type { Parser } from "./parser.js";
 // PURE STRING UTILITIES
 // =============================================================================
 
+/** Lexer-level escapes in unquoted arithmetic subscripts need quote removal. */
+export const quoteRemoveEscapes = (value: string): string => {
+  let quote: "'" | '"' | undefined;
+  let result = "";
+  for (let index = 0; index < value.length; index++) {
+    const character = value[index];
+    if (character === "\\" && quote === '"' && index + 1 < value.length) {
+      result += character + value[index + 1];
+      index += 1;
+      continue;
+    }
+    if (character === "'" || character === '"') {
+      if (quote === character) quote = undefined;
+      else if (!quote) quote = character;
+      result += character;
+      continue;
+    }
+    if (character === "\\" && !quote && index + 1 < value.length) {
+      const escaped = value[index + 1];
+      result += escaped === "$" || escaped === "`" ? `\\${escaped}` : escaped;
+      index += 1;
+      continue;
+    }
+    result += character;
+  }
+  return result;
+};
+
 /**
  * Decode a byte array as UTF-8 with error recovery.
  * Valid UTF-8 sequences are decoded to their Unicode characters.
@@ -669,10 +697,12 @@ export function tryParseBraceExpansion(
     // Split by comma at top level (handling nested braces)
     const rawItems = splitBraceItems(inner);
     // Parse each item as a word with full expansion support
-    const items = rawItems.map((s) => ({
-      type: "Word" as const,
-      word: AST.word(parseWordPartsFn(p, s, false, false, false)),
-    }));
+    const items = rawItems.map((s) =>
+      p.withDepth(() => ({
+        type: "Word" as const,
+        word: AST.word(parseWordPartsFn(p, s, false, false, false)),
+      })),
+    );
     return {
       part: { type: "BraceExpansion", items },
       endIndex: closeIdx + 1,

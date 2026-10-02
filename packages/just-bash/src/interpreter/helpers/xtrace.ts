@@ -7,6 +7,7 @@
  */
 
 import { Parser } from "../../parser/parser.js";
+import { ArithmeticError, ControlFlowError } from "../errors.js";
 import { expandWord } from "../expansion.js";
 import type { InterpreterContext } from "../types.js";
 
@@ -34,6 +35,15 @@ async function getXtracePrefix(ctx: InterpreterContext): Promise<string> {
     return "";
   }
 
+  const xtraceWasEnabled = ctx.state.options.xtrace;
+  ctx.state.options.xtrace = false;
+  // PS4 is expanded for the trace line only. A command substitution in it must
+  // not become the traced command's status, so `$?` and the substitution
+  // marker are put back exactly as they were: under `set -x` with a PS4 that
+  // substitutes, `x=1` is still 0 and `x=$(exit 7)` is still 7.
+  const savedExitCode = ctx.state.lastExitCode;
+  const savedExitCodeVar = ctx.state.env.get("?");
+  const savedSubstitutionExitCode = ctx.state.lastSubstitutionExitCode;
   try {
     // Parse PS4 as a word to handle variable expansion
     const parser = new Parser();
@@ -43,11 +53,33 @@ async function getXtracePrefix(ctx: InterpreterContext): Promise<string> {
     const expanded = await expandWord(ctx, wordNode);
 
     return expanded;
-  } catch {
+  } catch (error) {
+    // A runtime arithmetic error in PS4 affects the prompt only. Bash reports
+    // it but still executes the command; keeping the literal prompt preserves
+    // that non-fatal behavior without allowing execution/security errors to be
+    // swallowed by tracing.
+    if (error instanceof ArithmeticError && !error.fatal) {
+      return ps4;
+    }
+    if (
+      error instanceof ControlFlowError ||
+      (error instanceof Error && error.name === "AbortError")
+    ) {
+      throw error;
+    }
     // If expansion fails, print error to stderr (like bash does) and return literal PS4
     // Bash continues execution but reports the error
     ctx.state.expansionStderr = `${ctx.state.expansionStderr || ""}bash: ${ps4}: bad substitution\n`;
     return ps4 || DEFAULT_PS4;
+  } finally {
+    ctx.state.options.xtrace = xtraceWasEnabled;
+    ctx.state.lastExitCode = savedExitCode;
+    ctx.state.lastSubstitutionExitCode = savedSubstitutionExitCode;
+    if (savedExitCodeVar === undefined) {
+      ctx.state.env.delete("?");
+    } else {
+      ctx.state.env.set("?", savedExitCodeVar);
+    }
   }
 }
 

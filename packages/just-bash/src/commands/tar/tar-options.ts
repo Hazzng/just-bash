@@ -32,10 +32,18 @@ export interface TarOptions {
 }
 
 export function parseOptions(
-  args: string[],
+  rawArgs: string[],
 ):
   | { ok: true; options: TarOptions; files: string[] }
   | { ok: false; error: ExecResult } {
+  // GNU old-style syntax takes option arguments from the following argv
+  // entries, in the same order as their letters appear in the bundle. Expand
+  // it into ordinary one-letter options without ever treating later option
+  // letters as an attached value.
+  const args =
+    rawArgs.length > 0 && rawArgs[0] !== "" && !rawArgs[0].startsWith("-")
+      ? expandOldStyleOptions(rawArgs)
+      : rawArgs;
   const options: TarOptions = {
     create: false,
     append: false,
@@ -359,4 +367,21 @@ export function parseOptions(
   }
 
   return { ok: true, options, files };
+}
+
+function expandOldStyleOptions(rawArgs: string[]): string[] {
+  const bundle = rawArgs[0];
+  const expanded: string[] = [];
+  let valueIndex = 1;
+
+  for (const option of bundle) {
+    expanded.push(`-${option}`);
+    if ("fCTX".includes(option) && valueIndex < rawArgs.length) {
+      expanded.push(rawArgs[valueIndex]);
+      valueIndex++;
+    }
+  }
+
+  expanded.push(...rawArgs.slice(valueIndex));
+  return expanded;
 }

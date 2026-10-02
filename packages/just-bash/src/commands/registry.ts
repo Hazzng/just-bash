@@ -1,10 +1,15 @@
-// Command registry with statically analyzable lazy loading
+// RuntimeCommand registry with statically analyzable lazy loading
 // Each command has an explicit loader function for bundler compatibility (Next.js, etc.)
 
+import { raceCancellation } from "../abort-signals.js";
 import { DefenseInDepthBox } from "../security/defense-in-depth-box.js";
-import type { Command, CommandContext, ExecResult } from "../types.js";
+import type {
+  ExecResult,
+  RuntimeCommand,
+  RuntimeCommandContext,
+} from "../types.js";
 
-type CommandLoader = () => Promise<Command>;
+type CommandLoader = () => Promise<RuntimeCommand>;
 
 interface LazyCommandDef<T extends string = string> {
   name: T;
@@ -18,6 +23,7 @@ export type CommandName =
   | "printf"
   | "ls"
   | "mkdir"
+  | "mktemp"
   | "rmdir"
   | "touch"
   | "rm"
@@ -66,6 +72,7 @@ export type CommandName =
   | "xargs"
   | "true"
   | "false"
+  | "yes"
   | "clear"
   | "bash"
   | "sh"
@@ -137,6 +144,10 @@ const commandLoaders: LazyCommandDef<CommandName>[] = [
   {
     name: "mkdir",
     load: async () => (await import("./mkdir/mkdir.js")).mkdirCommand,
+  },
+  {
+    name: "mktemp",
+    load: async () => (await import("./mktemp/mktemp.js")).mktempCommand,
   },
   {
     name: "rmdir",
@@ -347,6 +358,10 @@ const commandLoaders: LazyCommandDef<CommandName>[] = [
     load: async () => (await import("./true/true.js")).falseCommand,
   },
   {
+    name: "yes",
+    load: async () => (await import("./yes/yes.js")).yesCommand,
+  },
+  {
     name: "clear",
     load: async () => (await import("./clear/clear.js")).clearCommand,
   },
@@ -531,15 +546,18 @@ const networkCommandLoaders: LazyCommandDef<NetworkCommandName>[] = [
 ];
 
 // Cache for loaded commands
-const cache = new Map<string, Command>();
+const cache = new Map<string, RuntimeCommand>();
 
 /**
  * Creates a lazy command that loads on first execution
  */
-function createLazyCommand(def: LazyCommandDef): Command {
+function createLazyCommand(def: LazyCommandDef): RuntimeCommand {
   return {
     name: def.name,
-    async execute(args: string[], ctx: CommandContext): Promise<ExecResult> {
+    async execute(
+      args: string[],
+      ctx: RuntimeCommandContext,
+    ): Promise<ExecResult> {
       let cmd = cache.get(def.name);
 
       if (!cmd) {
@@ -547,7 +565,21 @@ function createLazyCommand(def: LazyCommandDef): Command {
         // Module loading may access blocked globals (e.g., worker_threads
         // uses SharedArrayBuffer, sql.js uses WebAssembly), so we suspend
         // blocking during the import.
-        cmd = await DefenseInDepthBox.runTrustedAsync(() => def.load());
+        //
+        // Loading is host work that cannot be cancelled, so give up on waiting
+        // for it once this invocation is cancelled: holding the caller's cleanup
+        // grace window open would make the cancelled command look like one that
+        // ignored cancellation. The trusted scope covers the wait, so giving up
+        // also releases it instead of leaving blocking suspended for work that
+        // runs afterwards. The import keeps running in the async context that
+        // was trusted for it.
+        cmd = await DefenseInDepthBox.runTrustedAsync(() =>
+          raceCancellation(
+            def.load(),
+            ctx.signal,
+            `bash: ${def.name} was cancelled before it started\n`,
+          ),
+        );
         cache.set(def.name, cmd);
       }
 
@@ -556,7 +588,11 @@ function createLazyCommand(def: LazyCommandDef): Command {
         ctx.coverage &&
         (typeof __BROWSER__ === "undefined" || !__BROWSER__)
       ) {
-        const { emitFlagCoverage } = await import("./flag-coverage.js");
+        const { emitFlagCoverage } = await raceCancellation(
+          import("./flag-coverage.js"),
+          ctx.signal,
+          `bash: ${def.name} was cancelled before it started\n`,
+        );
         emitFlagCoverage(ctx.coverage, def.name, args);
       }
 
@@ -583,7 +619,7 @@ export function getNetworkCommandNames(): string[] {
  * Creates all lazy commands for registration (excludes network commands)
  * @param filter Optional array of command names to include. If not provided, all commands are created.
  */
-export function createLazyCommands(filter?: CommandName[]): Command[] {
+export function createLazyCommands(filter?: CommandName[]): RuntimeCommand[] {
   const loaders = filter
     ? commandLoaders.filter((def) => filter.includes(def.name))
     : commandLoaders;
@@ -594,7 +630,7 @@ export function createLazyCommands(filter?: CommandName[]): Command[] {
  * Creates network commands for registration (curl, etc.)
  * These are only registered when network is explicitly configured.
  */
-export function createNetworkCommands(): Command[] {
+export function createNetworkCommands(): RuntimeCommand[] {
   return networkCommandLoaders.map(createLazyCommand);
 }
 
@@ -610,7 +646,7 @@ export function getPythonCommandNames(): string[] {
  * These are only registered when python is explicitly enabled.
  * Note: Python introduces additional security surface (arbitrary code execution).
  */
-export function createPythonCommands(): Command[] {
+export function createPythonCommands(): RuntimeCommand[] {
   return pythonCommandLoaders.map(createLazyCommand);
 }
 
@@ -625,7 +661,7 @@ export function getJavaScriptCommandNames(): string[] {
  * Creates javascript commands for registration (js-exec).
  * These are only registered when javascript is explicitly enabled.
  */
-export function createJavaScriptCommands(): Command[] {
+export function createJavaScriptCommands(): RuntimeCommand[] {
   return jsCommandLoaders.map(createLazyCommand);
 }
 

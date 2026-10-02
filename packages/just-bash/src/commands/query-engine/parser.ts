@@ -283,8 +283,13 @@ function tokenize(input: string): Token[] {
     // Strings
     if (c === '"') {
       let str = "";
-      while (!isEof() && peek() !== '"') {
-        if (peek() === "\\") {
+      // Track \( ... ) interpolation depth so an inner `"` (nested string
+      // literal) inside the interpolation doesn't terminate the outer string.
+      let interpDepth = 0;
+      while (!isEof()) {
+        const ch = peek();
+        if (interpDepth === 0 && ch === '"') break;
+        if (interpDepth === 0 && ch === "\\") {
           advance();
           if (isEof()) break;
           const escaped = advance();
@@ -306,13 +311,37 @@ function tokenize(input: string): Token[] {
               break;
             case "(":
               str += "\\(";
+              interpDepth = 1;
               break; // Keep for string interpolation
             default:
               str += escaped;
           }
-        } else {
-          str += advance();
+          continue;
         }
+        if (interpDepth > 0) {
+          // Inside \( ... ): preserve raw characters so the interpolation
+          // parser can re-tokenize them. Skip over nested string literals
+          // verbatim and track paren depth.
+          if (ch === '"') {
+            str += advance(); // opening quote
+            while (!isEof()) {
+              const nc = peek();
+              if (nc === "\\") {
+                str += advance(); // backslash
+                if (!isEof()) str += advance(); // escaped char
+                continue;
+              }
+              str += advance();
+              if (nc === '"') break;
+            }
+            continue;
+          }
+          if (ch === "(") interpDepth++;
+          else if (ch === ")") interpDepth--;
+          str += advance();
+          continue;
+        }
+        str += advance();
       }
       if (!isEof()) advance(); // closing quote
       tokens.push({ type: "STRING", value: str, pos: start });
@@ -347,9 +376,15 @@ function tokenize(input: string): Token[] {
 class Parser {
   private tokens: Token[];
   private pos = 0;
+  private depth: number;
 
-  constructor(tokens: Token[]) {
+  constructor(
+    tokens: Token[],
+    private readonly maxDepth: number,
+    initialDepth = 0,
+  ) {
     this.tokens = tokens;
+    this.depth = initialDepth;
   }
 
   private peek(offset = 0): Token {
@@ -380,6 +415,19 @@ class Parser {
       );
     }
     return this.advance();
+  }
+
+  private withDepth<T>(parseNested: () => T): T {
+    this.depth++;
+    if (this.depth > this.maxDepth) {
+      this.depth--;
+      throw new Error(`query parse depth limit exceeded (${this.maxDepth})`);
+    }
+    try {
+      return parseNested();
+    } finally {
+      this.depth--;
+    }
   }
 
   private isFieldNameAfterDot(dotOffset = 0): boolean {
@@ -422,7 +470,16 @@ class Parser {
   }
 
   private parseExpr(): AstNode {
-    return this.parsePipe();
+    this.depth++;
+    if (this.depth > this.maxDepth) {
+      this.depth--;
+      throw new Error(`query parse depth limit exceeded (${this.maxDepth})`);
+    }
+    try {
+      return this.parsePipe();
+    } finally {
+      this.depth--;
+    }
   }
 
   /**
@@ -434,6 +491,19 @@ class Parser {
    *   {$a, ...}         - shorthand object destructuring (key same as var name)
    */
   private parsePattern(): DestructurePattern {
+    this.depth++;
+    if (this.depth > this.maxDepth) {
+      this.depth--;
+      throw new Error(`query parse depth limit exceeded (${this.maxDepth})`);
+    }
+    try {
+      return this.parsePatternInner();
+    } finally {
+      this.depth--;
+    }
+  }
+
+  private parsePatternInner(): DestructurePattern {
     // Array pattern: [$a, $b, ...]
     if (this.match("LBRACKET")) {
       const elements: DestructurePattern[] = [];
@@ -607,7 +677,7 @@ class Parser {
       "UPDATE_PIPE",
     );
     if (tok) {
-      const value = this.parseVarBind();
+      const value = this.withDepth(() => this.parseVarBind());
       const op = opMap.get(tok.type);
       if (op) {
         return { type: "UpdateOp", op, path: left, value };
@@ -705,11 +775,18 @@ class Parser {
   }
 
   private parseUnary(): AstNode {
-    if (this.match("MINUS")) {
-      const operand = this.parseUnary();
-      return { type: "UnaryOp", op: "-", operand };
+    let unaryCount = 0;
+    while (this.match("MINUS")) {
+      unaryCount++;
+      if (this.depth + unaryCount > this.maxDepth) {
+        throw new Error(`query parse depth limit exceeded (${this.maxDepth})`);
+      }
     }
-    return this.parsePostfix();
+    let operand = this.parsePostfix();
+    while (unaryCount-- > 0) {
+      operand = { type: "UnaryOp", op: "-", operand };
+    }
+    return operand;
   }
 
   private parsePostfix(): AstNode {
@@ -843,10 +920,10 @@ class Parser {
 
     // try-catch
     if (this.match("TRY")) {
-      const body = this.parsePostfix();
+      const body = this.withDepth(() => this.parsePostfix());
       let catchExpr: AstNode | undefined;
       if (this.match("CATCH")) {
-        catchExpr = this.parsePostfix();
+        catchExpr = this.withDepth(() => this.parsePostfix());
       }
       return { type: "Try", body, catch: catchExpr };
     }
@@ -1005,6 +1082,19 @@ class Parser {
   }
 
   private parseObjectConstruction(): ObjectNode {
+    this.depth++;
+    if (this.depth > this.maxDepth) {
+      this.depth--;
+      throw new Error(`query parse depth limit exceeded (${this.maxDepth})`);
+    }
+    try {
+      return this.parseObjectConstructionInner();
+    } finally {
+      this.depth--;
+    }
+  }
+
+  private parseObjectConstructionInner(): ObjectNode {
     const entries: ObjectNode["entries"] = [];
 
     if (!this.check("RBRACE")) {
@@ -1091,17 +1181,39 @@ class Parser {
           current = "";
         }
         i += 2;
-        // Find matching paren
+        // Find matching paren, skipping over nested string literals so
+        // parens inside them don't affect depth counting.
         let depth = 1;
         let exprStr = "";
         while (i < str.length && depth > 0) {
-          if (str[i] === "(") depth++;
-          else if (str[i] === ")") depth--;
-          if (depth > 0) exprStr += str[i];
+          const ch = str[i];
+          if (ch === '"') {
+            exprStr += ch;
+            i++;
+            while (i < str.length) {
+              const nc = str[i];
+              if (nc === "\\") {
+                exprStr += nc;
+                i++;
+                if (i < str.length) {
+                  exprStr += str[i];
+                  i++;
+                }
+                continue;
+              }
+              exprStr += nc;
+              i++;
+              if (nc === '"') break;
+            }
+            continue;
+          }
+          if (ch === "(") depth++;
+          else if (ch === ")") depth--;
+          if (depth > 0) exprStr += ch;
           i++;
         }
         const tokens = tokenize(exprStr);
-        const parser = new Parser(tokens);
+        const parser = new Parser(tokens, this.maxDepth, this.depth);
         parts.push(parser.parse());
       } else {
         current += str[i];
@@ -1121,8 +1233,27 @@ class Parser {
 // Convenience function
 // ============================================================================
 
-export function parse(input: string): AstNode {
+export interface QueryParseLimits {
+  maxDepth?: number;
+  maxTokens?: number;
+  maxSourceLength?: number;
+}
+
+export function parse(input: string, limits: QueryParseLimits = {}): AstNode {
+  const maxDepth = limits.maxDepth ?? 256;
+  const maxTokens = limits.maxTokens ?? 100_000;
+  const maxSourceLength = limits.maxSourceLength ?? 1_048_576;
+  if (input.length > maxSourceLength) {
+    throw new Error(
+      `query source length limit exceeded (${maxSourceLength} characters)`,
+    );
+  }
+  // A token needs at least one source character. Enforcing this before
+  // tokenization bounds the token array prospectively as well.
+  if (input.length + 1 > maxTokens) {
+    throw new Error(`query token limit exceeded (${maxTokens})`);
+  }
   const tokens = tokenize(input);
-  const parser = new Parser(tokens);
+  const parser = new Parser(tokens, maxDepth);
   return parser.parse();
 }

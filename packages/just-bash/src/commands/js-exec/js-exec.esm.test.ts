@@ -143,6 +143,81 @@ describe("js-exec ESM modules", () => {
     expect(r3.exitCode).toBe(0);
   });
 
+  it(
+    "should time out unresolved top-level await",
+    { timeout: 30000 },
+    async () => {
+      const env = new Bash({
+        javascript: true,
+        executionLimits: { maxJsTimeoutMs: 200 },
+      });
+      const result = await env.exec(
+        `js-exec -m -c "await new Promise(() => {})"`,
+      );
+
+      expect(result.stdout).toBe("");
+      expect(result.stderr).toMatch(
+        /^(?:\njs-exec: execution timeout exceeded\n)?js-exec: Execution timeout: exceeded 200ms limit\n$/,
+      );
+      expect(result.exitCode).toBe(124);
+    },
+  );
+
+  it("should report rejected top-level await", async () => {
+    const env = new Bash({ javascript: true });
+    const result = await env.exec(
+      `js-exec -m -c "await Promise.reject(new Error('top-level await rejected'))"`,
+    );
+
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toBe(
+      "at <anonymous> (-c:1:31): top-level await rejected\n",
+    );
+    expect(result.exitCode).toBe(1);
+  });
+
+  it("should load dynamic imports in function-body mode", async () => {
+    const env = new Bash({
+      files: { "/dep.mjs": "export const value = 'loaded';" },
+      javascript: true,
+    });
+    const result = await env.exec(
+      `js-exec -c "const module = await import('./dep.mjs'); console.log(module.value); return module.value"`,
+    );
+
+    expect(result).toMatchObject({
+      exitCode: 0,
+      stderr: "",
+      stdout: "loaded\n",
+    });
+  });
+
+  it("should support top-level await without inspecting source text", async () => {
+    const env = new Bash({ javascript: true });
+    const result = await env.exec(
+      `js-exec -c "await /* comments are valid here */ Promise.resolve(); console.log('ok')"`,
+    );
+
+    expect(result).toMatchObject({
+      exitCode: 0,
+      stderr: "",
+      stdout: "ok\n",
+    });
+  });
+
+  it("should not infer module mode from strings", async () => {
+    const env = new Bash({ javascript: true });
+    const result = await env.exec(
+      `js-exec -c 'const text = "await value"; console.log(text); return text'`,
+    );
+
+    expect(result).toMatchObject({
+      exitCode: 0,
+      stderr: "",
+      stdout: "await value\n",
+    });
+  });
+
   it("should handle transitive imports", async () => {
     const env = new Bash({
       javascript: true,

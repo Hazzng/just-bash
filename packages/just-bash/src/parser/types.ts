@@ -9,8 +9,15 @@ import { type Token, TokenType } from "./lexer.js";
 // Parser limits to prevent hangs and resource exhaustion
 export const MAX_INPUT_SIZE = 1_000_000; // 1MB max input
 export const MAX_TOKENS = 100_000; // Max tokens to parse
-export const MAX_PARSE_ITERATIONS = 1_000_000; // Max iterations in parsing loops
+const MAX_PARSE_ITERATIONS = 1_000_000; // Max iterations in parsing loops
 export const MAX_PARSER_DEPTH = 200; // Max recursion depth for nested constructs
+
+export enum WordParseContext {
+  Default = 0,
+  Assignment = 1 << 0,
+  NoBraceExpansion = 1 << 1,
+  Regex = 1 << 2,
+}
 
 // Pre-computed Sets for fast redirection token lookup (avoids array allocation per call)
 export const REDIRECTION_TOKENS: Set<TokenType> = new Set([
@@ -73,5 +80,59 @@ export class ParseException extends Error {
   ) {
     super(`Parse error at ${line}:${column}: ${message}`);
     this.name = "ParseException";
+  }
+}
+
+/** Mutable limits shared by every parser created for one top-level source. */
+export class ParseBudget {
+  private iterations = 0;
+  private tokens = 0;
+  private depth = 0;
+
+  reset(): void {
+    this.iterations = 0;
+    this.tokens = 0;
+    this.depth = 0;
+  }
+
+  chargeIteration(line: number, column: number): void {
+    this.iterations++;
+    if (this.iterations > MAX_PARSE_ITERATIONS) {
+      throw new ParseException(
+        "Maximum parse iterations exceeded (possible infinite loop)",
+        line,
+        column,
+      );
+    }
+  }
+
+  chargeTokens(count: number, line = 1, column = 1): void {
+    this.tokens += count;
+    if (this.tokens > MAX_TOKENS) {
+      throw new ParseException(
+        `Too many tokens: cumulative count exceeds limit of ${MAX_TOKENS}`,
+        line,
+        column,
+      );
+    }
+  }
+
+  enter(line: number, column: number): () => void {
+    this.depth++;
+    if (this.depth > MAX_PARSER_DEPTH) {
+      this.depth--;
+      throw new ParseException(
+        `Maximum parser nesting depth exceeded (${MAX_PARSER_DEPTH})`,
+        line,
+        column,
+      );
+    }
+
+    let active = true;
+    return () => {
+      if (!active) return;
+      active = false;
+      this.depth--;
+    };
   }
 }
