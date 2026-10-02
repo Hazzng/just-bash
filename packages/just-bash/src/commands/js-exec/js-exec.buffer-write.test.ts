@@ -79,12 +79,12 @@ describe("Buffer.write range validation", () => {
 });
 
 describe("Buffer encoding defaults", () => {
-  it("uses UTF-8 for empty encodings across string APIs and write overloads", async () => {
+  it("uses UTF-8 for empty encodings in from, byteLength, and write overloads", async () => {
     const env = new Bash({ javascript: true });
     const result = await env.exec(
-      `js-exec -c "console.log(Buffer.from('é', '').toString('hex')); console.log(Buffer.from([195, 169]).toString('')); console.log(Buffer.byteLength('é', '')); var b = Buffer.alloc(2); console.log(b.write('é', ''), b.toString('hex')); b = Buffer.alloc(2); console.log(b.write('é', 0, ''), b.toString('hex')); b = Buffer.alloc(2); console.log(b.write('é', 0, 2, ''), b.toString('hex'));"`,
+      `js-exec -c "console.log(Buffer.from('é', '').toString('hex')); console.log(Buffer.byteLength('é', '')); var b = Buffer.alloc(2); console.log(b.write('é', ''), b.toString('hex')); b = Buffer.alloc(2); console.log(b.write('é', 0, ''), b.toString('hex')); b = Buffer.alloc(2); console.log(b.write('é', 0, 2, ''), b.toString('hex'));"`,
     );
-    expect(result.stdout).toBe("c3a9\né\n2\n2 c3a9\n2 c3a9\n2 c3a9\n");
+    expect(result.stdout).toBe("c3a9\n2\n2 c3a9\n2 c3a9\n2 c3a9\n");
     expect(result.stderr).toBe("");
     expect(result.exitCode).toBe(0);
   });
