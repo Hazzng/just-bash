@@ -17,6 +17,23 @@ import type { Parser } from "./parser.js";
 import { ParseException } from "./types.js";
 import * as WordParser from "./word-parser.js";
 
+function normalizeRegexBracketEscapes(pattern: string): string {
+  let normalized = "";
+  for (let index = 0; index < pattern.length; index++) {
+    const character = pattern[index];
+    const escaped = pattern[index + 1];
+    if (character !== "\\" || escaped === undefined) {
+      normalized += character;
+      continue;
+    }
+
+    if ("\\[]^-".includes(escaped)) normalized += "\\";
+    normalized += escaped;
+    index++;
+  }
+  return normalized;
+}
+
 /** Ensure a word-parts array is non-empty (use empty-string literal as fallback). */
 function ensureNonEmpty(parts: WordPart[]): WordPart[] {
   return parts.length > 0 ? parts : [AST.literal("")];
@@ -127,7 +144,7 @@ function parseParameterExpansion(
   // Handle array subscript
   if (value[i] === "[") {
     const closeIdx = WordParser.findMatchingBracket(p, value, i, "[", "]");
-    name += value.slice(i, closeIdx + 1);
+    name += `[${WordParser.quoteRemoveEscapes(value.slice(i + 1, closeIdx))}]`;
     i = closeIdx + 1;
 
     // Check for multiple subscripts like ${a[0][0]} - this is invalid syntax
@@ -355,17 +372,19 @@ function parseParameterOperation(
       const wordStr = value.slice(i, wordEnd);
       // Parse the word for expansions (variables, arithmetic, command substitution)
       // When inside double quotes, single quotes should be literal, not quote delimiters
-      const wordParts = parseWordParts(
-        p,
-        wordStr,
-        false,
-        false,
-        true, // isAssignment=true for tilde expansion after : in default values
-        false,
-        quoted,
-        false, // noBraceExpansion
-        false, // regexPattern
-        true, // inParameterExpansion - so \} is treated as escaped }
+      const wordParts = p.withDepth(() =>
+        parseWordParts(
+          p,
+          wordStr,
+          false,
+          false,
+          true, // isAssignment=true for tilde expansion after : in default values
+          false,
+          quoted,
+          false, // noBraceExpansion
+          false, // regexPattern
+          true, // inParameterExpansion - so \} is treated as escaped }
+        ),
       );
       const word = AST.word(ensureNonEmpty(wordParts));
 
@@ -450,17 +469,19 @@ function parseParameterOperation(
     const wordStr = value.slice(i, wordEnd);
     // Parse the word for expansions (variables, arithmetic, command substitution)
     // When inside double quotes, single quotes should be literal, not quote delimiters
-    const wordParts = parseWordParts(
-      p,
-      wordStr,
-      false,
-      false,
-      true, // isAssignment=true for tilde expansion after : in default values
-      false,
-      quoted,
-      false, // noBraceExpansion
-      false, // regexPattern
-      true, // inParameterExpansion - so \} is treated as escaped }
+    const wordParts = p.withDepth(() =>
+      parseWordParts(
+        p,
+        wordStr,
+        false,
+        false,
+        true, // isAssignment=true for tilde expansion after : in default values
+        false,
+        quoted,
+        false, // noBraceExpansion
+        false, // regexPattern
+        true, // inParameterExpansion - so \} is treated as escaped }
+      ),
     );
     const word = AST.word(ensureNonEmpty(wordParts));
 
@@ -503,7 +524,9 @@ function parseParameterOperation(
     const patternEnd = WordParser.findParameterOperationEnd(p, value, i);
     const patternStr = value.slice(i, patternEnd);
     // Parse the pattern for variable expansions and quoting (like PatternReplacement)
-    const patternParts = parseWordParts(p, patternStr, false, false, false);
+    const patternParts = p.withDepth(() =>
+      parseWordParts(p, patternStr, false, false, false),
+    );
     const pattern = AST.word(ensureNonEmpty(patternParts));
 
     return {
@@ -538,7 +561,9 @@ function parseParameterOperation(
     }
     const patternStr = value.slice(i, patternEnd);
     // Parse the pattern for variable expansions (e.g., ${var//$pat/repl})
-    const patternParts = parseWordParts(p, patternStr, false, false, false);
+    const patternParts = p.withDepth(() =>
+      parseWordParts(p, patternStr, false, false, false),
+    );
     const pattern = AST.word(ensureNonEmpty(patternParts));
 
     let replacement: WordNode | null = null;
@@ -553,7 +578,9 @@ function parseParameterOperation(
       );
       const replaceStr = value.slice(replaceStart, replaceEnd);
       // Parse the replacement for variable expansions
-      const replaceParts = parseWordParts(p, replaceStr, false, false, false);
+      const replaceParts = p.withDepth(() =>
+        parseWordParts(p, replaceStr, false, false, false),
+      );
       replacement = AST.word(ensureNonEmpty(replaceParts));
       endIdx = replaceEnd;
     }
@@ -823,6 +850,8 @@ export function parseWordParts(
   regexPattern = false,
   /** When true, \} is treated as escaped } (used in parameter expansion default values) */
   inParameterExpansion = false,
+  /** Whether this token starts the complete shell word. */
+  atWordStart = true,
 ): WordPart[] {
   if (singleQuoted) {
     // Single quotes: no expansion
@@ -877,14 +906,8 @@ export function parseWordParts(
   while (i < value.length) {
     const char = value[i];
 
-    // Handle escape sequences
-    // In unquoted context, only certain characters are escapable
-    // In here-docs, only $, `, \, newline are escapable (NOT ")
-    // In regular words, $, `, \, ", newline are escapable
-    // Glob metacharacters (*, ?, [, ]) when escaped should create Escaped nodes
-    // so they're treated as literals during globbing
-    // In regex patterns, ALL escaped characters create Escaped nodes so the backslash
-    // is preserved for the regex engine (e.g., \$ matches literal $)
+    // Handle escape sequences. Unquoted words preserve every escape as an
+    // Escaped part, while here-docs and double quotes use narrower rules.
     if (char === "\\" && i + 1 < value.length) {
       const next = value[i + 1];
 
@@ -897,8 +920,16 @@ export function parseWordParts(
         continue;
       }
 
-      // Characters that should be escaped (result in just the literal char)
-      // Inside parameter expansion default values, \} is also escapable to produce }
+      if (!hereDoc && !singleQuotesAreLiteral) {
+        if (next !== "\n") {
+          flushLiteral();
+          parts.push(AST.escaped(next));
+        }
+        i += 2;
+        continue;
+      }
+
+      // Handle the narrower here-doc and double-quote escape sets.
       const isEscapable = hereDoc
         ? next === "$" || next === "`" || next === "\n"
         : next === "$" ||
@@ -918,7 +949,9 @@ export function parseWordParts(
         ? "*?[]\\".includes(next)
         : "*?[]\\(){}.^+".includes(next);
       if (isEscapable) {
-        literal += next;
+        if (next !== "\n") {
+          literal += next;
+        }
       } else if (isGlobMetaOrBackslash) {
         // Create an Escaped node for glob metacharacters and backslash
         flushLiteral();
@@ -987,11 +1020,26 @@ export function parseWordParts(
       continue;
     }
 
+    // Parameter-expansion operands and other recursively parsed fragments stay
+    // inside one lexer token, so process substitutions in them need this string seam.
+    if (
+      (char === "<" || char === ">") &&
+      value[i + 1] === "(" &&
+      !hereDoc &&
+      !singleQuotesAreLiteral
+    ) {
+      flushLiteral();
+      const { part, endIndex } = p.parseProcessSubstitutionFromString(value, i);
+      parts.push(part);
+      i = endIndex;
+      continue;
+    }
+
     // Handle tilde expansion
     if (char === "~") {
       const prevChar = i > 0 ? value[i - 1] : "";
       const canExpandAfterColon = isAssignment && prevChar === ":";
-      if (i === 0 || prevChar === "=" || canExpandAfterColon) {
+      if ((i === 0 && atWordStart) || prevChar === "=" || canExpandAfterColon) {
         const tildeEnd = WordParser.findTildeEnd(p, value, i);
         const afterTilde = value[tildeEnd];
         if (
@@ -1032,7 +1080,10 @@ export function parseWordParts(
     if (char === "*" || char === "?" || char === "[") {
       flushLiteral();
       const { pattern, endIndex } = WordParser.parseGlobPattern(p, value, i);
-      parts.push({ type: "Glob", pattern });
+      parts.push({
+        type: "Glob",
+        pattern: regexPattern ? normalizeRegexBracketEscapes(pattern) : pattern,
+      });
       i = endIndex;
       continue;
     }

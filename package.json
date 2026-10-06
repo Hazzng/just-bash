@@ -6,7 +6,7 @@
     "build": "pnpm --filter './packages/*' build",
     "build:worker": "pnpm --filter just-bash build:worker",
     "typecheck": "pnpm --filter just-bash build && pnpm --filter './packages/*' typecheck",
-    "lint": "biome check . && pnpm --filter './packages/*' lint:banned",
+    "lint": "node scripts/check-workflow-security.mjs && biome check . && pnpm --filter './packages/*' lint:banned",
     "lint:fix": "biome check --write .",
     "knip": "pnpm --filter './packages/*' knip",
     "test:run": "pnpm --filter './packages/*' test:run",
@@ -17,6 +17,7 @@
     "test:dist": "pnpm --filter './packages/*' test:dist",
     "test:examples": "pnpm --filter cjs-consumer-example typecheck",
     "check:worker-sync": "pnpm --filter just-bash check:worker-sync",
+    "check:deepsec-revalidation": "node scripts/check-deepsec-revalidation.mjs",
     "shell": "pnpm --filter just-bash shell",
     "dev:exec": "pnpm --filter just-bash dev:exec",
     "changeset": "changeset",
@@ -26,11 +27,13 @@
   "devDependencies": {
     "@biomejs/biome": "2.3.10",
     "@changesets/changelog-github": "^0.6.0",
-    "@changesets/cli": "^2.31.0"
+    "@changesets/cli": "^2.31.1"
   },
   "pnpm": {
     "overrides": {
-      "postcss@<8.5.10": "^8.5.10"
+      "postcss@<8.5.10": "^8.5.10",
+      "brace-expansion@<1.1.21": "1.1.21",
+      "brace-expansion@>=5.0.0 <5.0.12": "5.0.12"
     }
   },
   "packageManager": "pnpm@10.33.2+sha512.a90faf6feeab71ad6c6e57f94e0fe1a12f5dcc22cd754db40ae9593eb6a3e0b6b12e3540218bb37ae083404b1f2ce6db2a4121e979829b4aff94b99f49da1cf8"

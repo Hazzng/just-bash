@@ -15,19 +15,19 @@ import type {
   CommandNode,
   ConditionalCommandNode,
   GroupNode,
-  HereDocNode,
   PipelineNode,
   ScriptNode,
   SimpleCommandNode,
   StatementNode,
   SubshellNode,
-  WordNode,
 } from "../ast/types.js";
 import {
-  encodeUtf8ToBytes,
+  decodedTextFromResult,
   latin1FromBytes,
-  readBytesFrom,
+  stdoutAsBytes,
 } from "../encoding.js";
+import { ExecutionOutputAccumulator } from "../execution-output.js";
+import type { ExecutionScope } from "../execution-scope.js";
 import type { IFileSystem } from "../fs/interface.js";
 import { mapToRecord } from "../helpers/env.js";
 import type { ExecutionLimits } from "../limits.js";
@@ -80,26 +80,27 @@ import {
   ReturnError,
 } from "./errors.js";
 import { expandWord, expandWordWithGlob } from "./expansion.js";
+import { advanceFd } from "./fd-table.js";
 import { executeFunctionDef } from "./functions.js";
-import {
-  checkFdLimit,
-  failure,
-  OK,
-  result,
-  testResult,
-  throwExecutionLimit,
-} from "./helpers/result.js";
+import { failure, OK, result, testResult } from "./helpers/result.js";
 import { isPosixSpecialBuiltin } from "./helpers/shell-constants.js";
-import {
-  isWordLiteralMatch,
-  parseRwFdContent,
-} from "./helpers/word-matching.js";
+import { nullCommandExitStatus } from "./helpers/substitution-status.js";
+import { isWordLiteralMatch } from "./helpers/word-matching.js";
 import { traceSimpleCommand } from "./helpers/xtrace.js";
 import { executePipeline as executePipelineHelper } from "./pipeline-execution.js";
 import {
+  markProcessSubstitutions,
+  releaseProcessSubstitutions,
+} from "./process-substitution.js";
+import {
   applyRedirections,
-  preOpenOutputRedirects,
-  processFdVariableRedirections,
+  BARE_REDIRECTION_POLICY,
+  createRedirectionTransaction,
+  EXEC_REDIRECTION_POLICY,
+  preparedRedirectionError,
+  type RedirectionTransaction,
+  SIMPLE_REDIRECTION_POLICY,
+  withPreparedRedirections,
 } from "./redirections.js";
 import { processAssignments } from "./simple-command-assignments.js";
 import {
@@ -107,7 +108,15 @@ import {
   executeSubshell as executeSubshellHelper,
   executeUserScript as executeUserScriptHelper,
 } from "./subshell-group.js";
-import type { InterpreterContext, InterpreterState } from "./types.js";
+import type {
+  InterpreterContext,
+  InterpreterExecOptions,
+  InterpreterState,
+} from "./types.js";
+
+function unsupportedCommandNode(node: never): never {
+  throw new TypeError(`Unsupported command node: ${JSON.stringify(node)}`);
+}
 
 export type { InterpreterContext, InterpreterState } from "./types.js";
 
@@ -115,15 +124,11 @@ export interface InterpreterOptions {
   fs: IFileSystem;
   commands: CommandRegistry;
   limits: Required<ExecutionLimits>;
+  executionScope: ExecutionScope;
   exec: (
     script: string,
-    options?: {
-      env?: Record<string, string>;
-      cwd?: string;
-      replaceEnv?: boolean;
-      signal?: AbortSignal;
-      args?: string[];
-    },
+    options?: InterpreterExecOptions,
+    stdinAlreadyAccounted?: boolean,
   ) => Promise<ExecResult>;
   /** Optional secure fetch function for network-enabled commands */
   fetch?: SecureFetch;
@@ -140,7 +145,11 @@ export interface InterpreterOptions {
   /** Bootstrap JavaScript code for js-exec */
   jsBootstrapCode?: string;
   /** Tool invoker hook for js-exec's `tools` proxy */
-  invokeTool?: (path: string, argsJson: string) => Promise<string>;
+  invokeTool?: (
+    path: string,
+    argsJson: string,
+    abortSignal: AbortSignal,
+  ) => Promise<string>;
 }
 
 export class Interpreter {
@@ -152,6 +161,7 @@ export class Interpreter {
       fs: options.fs,
       commands: options.commands,
       limits: options.limits,
+      executionScope: options.executionScope,
       execFn: options.exec,
       executeScript: this.executeScript.bind(this),
       executeStatement: this.executeStatement.bind(this),
@@ -227,29 +237,22 @@ export class Interpreter {
   async executeScript(node: ScriptNode): Promise<ExecResult> {
     this.assertDefenseContext("execution");
 
-    let stdout = "";
-    let stderr = "";
     let exitCode = 0;
-    const maxOutputSize = this.ctx.limits.maxOutputSize;
-
-    const appendOutput = (nextStdout: string, nextStderr: string): void => {
-      if (
-        stdout.length + stderr.length + nextStdout.length + nextStderr.length >
-        maxOutputSize
-      ) {
-        throwExecutionLimit(
-          `total output size exceeded (>${maxOutputSize} bytes), increase executionLimits.maxOutputSize`,
-          "output_size",
-        );
-      }
-      stdout += nextStdout;
-      stderr += nextStderr;
-    };
+    const output = new ExecutionOutputAccumulator(
+      this.ctx.executionScope,
+      "script",
+    );
 
     for (const statement of node.statements) {
       try {
         const result = await this.executeStatement(statement);
-        appendOutput(result.stdout, result.stderr);
+        // Decode each statement's stdout to text via its explicit `stdoutKind`
+        // before concatenating. A script can interleave text-shaped statements
+        // (sed, awk — ö as U+00F6) with byte-shaped ones (grep | head — ö as
+        // bytes 0xC3 0xB6); concatenated raw, the lone high byte makes the
+        // combined stream invalid UTF-8 and the boundary decoder bails, leaving
+        // the byte half as mojibake. Decoding per statement isolates each shape.
+        output.appendResult(result, decodedTextFromResult(result));
         exitCode = result.exitCode;
         this.ctx.state.lastExitCode = exitCode;
         this.ctx.state.env.set("?", String(exitCode));
@@ -257,59 +260,92 @@ export class Interpreter {
         // ExitError always propagates up to terminate the script
         // This allows 'eval exit 42' and 'source exit.sh' to exit properly
         if (error instanceof ExitError) {
-          error.prependOutput(stdout, stderr);
+          error.prependOutput(output.stdout, output.stderr);
           throw error;
         }
         // PosixFatalError terminates the script in POSIX mode
         // POSIX 2.8.1: special builtins cause shell to exit on error
         if (error instanceof PosixFatalError) {
-          appendOutput(error.stdout, error.stderr);
+          output.append(
+            "stdout",
+            error.stdout,
+            error.internalOutputAccounting.stdout,
+          );
+          output.append(
+            "stderr",
+            error.stderr,
+            error.internalOutputAccounting.stderr,
+          );
           exitCode = error.exitCode;
           this.ctx.state.lastExitCode = exitCode;
           this.ctx.state.env.set("?", String(exitCode));
           return {
-            stdout,
-            stderr,
+            ...output.build(exitCode),
             exitCode,
             env: mapToRecord(this.ctx.state.env),
           };
         }
         // ExecutionLimitError must always propagate - these are safety limits
         if (error instanceof ExecutionLimitError) {
+          output.prependTo(error);
           throw error;
         }
         if (error instanceof ErrexitError) {
-          appendOutput(error.stdout, error.stderr);
+          output.append(
+            "stdout",
+            error.stdout,
+            error.internalOutputAccounting.stdout,
+          );
+          output.append(
+            "stderr",
+            error.stderr,
+            error.internalOutputAccounting.stderr,
+          );
           exitCode = error.exitCode;
           this.ctx.state.lastExitCode = exitCode;
           this.ctx.state.env.set("?", String(exitCode));
           return {
-            stdout,
-            stderr,
+            ...output.build(exitCode),
             exitCode,
             env: mapToRecord(this.ctx.state.env),
           };
         }
         if (error instanceof NounsetError) {
-          appendOutput(error.stdout, error.stderr);
+          output.append(
+            "stdout",
+            error.stdout,
+            error.internalOutputAccounting.stdout,
+          );
+          output.append(
+            "stderr",
+            error.stderr,
+            error.internalOutputAccounting.stderr,
+          );
           exitCode = 1;
           this.ctx.state.lastExitCode = exitCode;
           this.ctx.state.env.set("?", String(exitCode));
           return {
-            stdout,
-            stderr,
+            ...output.build(exitCode),
             exitCode,
             env: mapToRecord(this.ctx.state.env),
           };
         }
         if (error instanceof BadSubstitutionError) {
-          appendOutput(error.stdout, error.stderr);
+          output.append(
+            "stdout",
+            error.stdout,
+            error.internalOutputAccounting.stdout,
+          );
+          output.append(
+            "stderr",
+            error.stderr,
+            error.internalOutputAccounting.stderr,
+          );
           exitCode = 1;
           this.ctx.state.lastExitCode = exitCode;
           this.ctx.state.env.set("?", String(exitCode));
           return {
-            stdout,
-            stderr,
+            ...output.build(exitCode),
             exitCode,
             env: mapToRecord(this.ctx.state.env),
           };
@@ -317,7 +353,16 @@ export class Interpreter {
         // ArithmeticError in expansion (e.g., echo $((42x))) - the command fails
         // but the script continues execution. This matches bash behavior.
         if (error instanceof ArithmeticError) {
-          appendOutput(error.stdout, error.stderr);
+          output.append(
+            "stdout",
+            error.stdout,
+            error.internalOutputAccounting.stdout,
+          );
+          output.append(
+            "stderr",
+            error.stderr,
+            error.internalOutputAccounting.stderr,
+          );
           exitCode = 1;
           this.ctx.state.lastExitCode = exitCode;
           this.ctx.state.env.set("?", String(exitCode));
@@ -327,7 +372,16 @@ export class Interpreter {
         // BraceExpansionError for invalid ranges (e.g., {z..A} mixed case) - the command fails
         // but the script continues execution. This matches bash behavior.
         if (error instanceof BraceExpansionError) {
-          appendOutput(error.stdout, error.stderr);
+          output.append(
+            "stdout",
+            error.stdout,
+            error.internalOutputAccounting.stdout,
+          );
+          output.append(
+            "stderr",
+            error.stderr,
+            error.internalOutputAccounting.stderr,
+          );
           exitCode = 1;
           this.ctx.state.lastExitCode = exitCode;
           this.ctx.state.env.set("?", String(exitCode));
@@ -338,16 +392,17 @@ export class Interpreter {
         if (error instanceof BreakError || error instanceof ContinueError) {
           // If we're inside a loop, propagate the error up (for eval/source inside loops)
           if (this.ctx.state.loopDepth > 0) {
-            error.prependOutput(stdout, stderr);
+            error.prependOutput(output.stdout, output.stderr);
             throw error;
           }
           // Outside loops (level exceeded loop depth), silently continue with next statement
-          appendOutput(error.stdout, error.stderr);
+          output.append("stdout", error.stdout);
+          output.append("stderr", error.stderr);
           continue;
         }
         // Handle return - prepend accumulated output before propagating
         if (error instanceof ReturnError) {
-          error.prependOutput(stdout, stderr);
+          error.prependOutput(output.stdout, output.stderr);
           throw error;
         }
         throw error;
@@ -355,9 +410,7 @@ export class Interpreter {
     }
 
     return {
-      stdout,
-      stderr,
-      exitCode,
+      ...output.build(exitCode),
       env: mapToRecord(this.ctx.state.env),
     };
   }
@@ -383,14 +436,6 @@ export class Interpreter {
       throw new ExecutionAbortedError();
     }
 
-    this.ctx.state.commandCount++;
-    if (this.ctx.state.commandCount > this.ctx.limits.maxCommandCount) {
-      throwExecutionLimit(
-        `too many commands executed (>${this.ctx.limits.maxCommandCount}), increase executionLimits.maxCommandCount`,
-        "commands",
-      );
-    }
-
     // Check for deferred syntax error. This is triggered when execution reaches
     // a statement that has a syntax error (like standalone `}`), but the error
     // was deferred to support bash's incremental parsing behavior.
@@ -408,8 +453,10 @@ export class Interpreter {
     // It will be set by inner compound command executions if needed
     this.ctx.state.errexitSafe = false;
 
-    let stdout = "";
-    let stderr = "";
+    const statementOutput = new ExecutionOutputAccumulator(
+      this.ctx.executionScope,
+      "statement",
+    );
 
     // verbose mode (set -v): print unevaluated source before execution
     // Don't print verbose output inside command substitutions (suppressVerbose flag)
@@ -418,29 +465,37 @@ export class Interpreter {
       !this.ctx.state.suppressVerbose &&
       node.sourceText
     ) {
-      stderr += `${node.sourceText}\n`;
+      statementOutput.append("stderr", `${node.sourceText}\n`);
     }
     let exitCode = 0;
     let lastExecutedIndex = -1;
     let lastPipelineNegated = false;
 
-    for (let i = 0; i < node.pipelines.length; i++) {
-      const pipeline = node.pipelines[i];
-      const operator = i > 0 ? node.operators[i - 1] : null;
+    try {
+      for (let i = 0; i < node.pipelines.length; i++) {
+        const pipeline = node.pipelines[i];
+        const operator = i > 0 ? node.operators[i - 1] : null;
 
-      if (operator === "&&" && exitCode !== 0) continue;
-      if (operator === "||" && exitCode === 0) continue;
+        if (operator === "&&" && exitCode !== 0) continue;
+        if (operator === "||" && exitCode === 0) continue;
 
-      const result = await this.executePipeline(pipeline);
-      stdout += result.stdout;
-      stderr += result.stderr;
-      exitCode = result.exitCode;
-      lastExecutedIndex = i;
-      lastPipelineNegated = pipeline.negated;
+        const result = await this.executePipeline(pipeline);
+        // Decode each pipeline's stdout to text via its explicit `stdoutKind`
+        // before concatenating, so a statement that joins text-shaped and
+        // byte-shaped pipelines with && / || does not interleave raw byte and
+        // Unicode chunks (which would defeat the output-boundary UTF-8 decode).
+        statementOutput.appendResult(result, decodedTextFromResult(result));
+        exitCode = result.exitCode;
+        lastExecutedIndex = i;
+        lastPipelineNegated = pipeline.negated;
 
-      // Update $? after each pipeline so it's available for subsequent commands
-      this.ctx.state.lastExitCode = exitCode;
-      this.ctx.state.env.set("?", String(exitCode));
+        // Update $? after each pipeline so it's available for subsequent commands
+        this.ctx.state.lastExitCode = exitCode;
+        this.ctx.state.env.set("?", String(exitCode));
+      }
+    } catch (error) {
+      statementOutput.prependTo(error);
+      throw error;
     }
 
     // Track whether this exit code is "safe" for errexit purposes
@@ -466,10 +521,12 @@ export class Interpreter {
       !this.ctx.state.inCondition &&
       !innerWasSafe
     ) {
-      throw new ErrexitError(exitCode, stdout, stderr);
+      const error = new ErrexitError(exitCode);
+      error.prependOutput(statementOutput.stdout, statementOutput.stderr);
+      throw error;
     }
 
-    return result(stdout, stderr, exitCode);
+    return statementOutput.build(exitCode);
   }
 
   private async executePipeline(node: PipelineNode): Promise<ExecResult> {
@@ -478,9 +535,45 @@ export class Interpreter {
     );
   }
 
+  /**
+   * Execute a command, tearing down any process substitutions its own word
+   * expansion opened. Descriptor numbers are handed out from 63 downwards and
+   * released here, so they are reused per command exactly like bash and no
+   * backing file outlives the command that created it.
+   */
   private async executeCommand(
     node: CommandNode,
     stdin: string,
+    stdinOwned = false,
+  ): Promise<ExecResult> {
+    const procSubMark = markProcessSubstitutions(this.ctx);
+    let result: ExecResult;
+    try {
+      result = await this.executeCommandInner(node, stdin, stdinOwned);
+    } catch (error) {
+      await releaseProcessSubstitutions(this.ctx, procSubMark).catch(
+        () => undefined,
+      );
+      throw error;
+    }
+    const writer = await releaseProcessSubstitutions(this.ctx, procSubMark);
+    if (!writer.stdout && !writer.stderr) return result;
+    // A `>(cmd)` writer shares the shell's stdout and stderr in bash; append
+    // what it produced once the outer command has finished writing to it.
+    return {
+      ...result,
+      stdout: writer.stdout
+        ? latin1FromBytes(stdoutAsBytes(result)) + writer.stdout
+        : result.stdout,
+      stdoutKind: writer.stdout ? "bytes" : result.stdoutKind,
+      stderr: result.stderr + writer.stderr,
+    };
+  }
+
+  private async executeCommandInner(
+    node: CommandNode,
+    stdin: string,
+    stdinOwned: boolean,
   ): Promise<ExecResult> {
     this.assertDefenseContext("command");
 
@@ -497,13 +590,13 @@ export class Interpreter {
       case "While":
         return executeWhile(this.ctx, node, stdin);
       case "Until":
-        return executeUntil(this.ctx, node);
+        return executeUntil(this.ctx, node, stdin);
       case "Case":
         return executeCase(this.ctx, node);
       case "Subshell":
-        return this.executeSubshell(node, stdin);
+        return this.executeSubshell(node, stdin, stdinOwned);
       case "Group":
-        return this.executeGroup(node, stdin);
+        return this.executeGroup(node, stdin, stdinOwned);
       case "FunctionDef":
         return executeFunctionDef(this.ctx, node);
       case "ArithmeticCommand":
@@ -511,7 +604,7 @@ export class Interpreter {
       case "ConditionalCommand":
         return this.executeConditionalCommand(node);
       default:
-        return OK;
+        return unsupportedCommandNode(node);
     }
   }
 
@@ -519,9 +612,13 @@ export class Interpreter {
     node: SimpleCommandNode,
     stdin: string,
   ): Promise<ExecResult> {
+    let transaction: RedirectionTransaction | undefined;
     try {
-      return await this.executeSimpleCommandInner(node, stdin);
+      return await this.executeSimpleCommandInner(node, stdin, (created) => {
+        transaction = created;
+      });
     } catch (error) {
+      transaction?.finish();
       if (error instanceof GlobError) {
         // GlobError from failglob should return exit code 1 with error message
         return failure(error.stderr);
@@ -535,6 +632,7 @@ export class Interpreter {
   private async executeSimpleCommandInner(
     node: SimpleCommandNode,
     stdin: string,
+    onTransaction: (transaction: RedirectionTransaction) => void,
   ): Promise<ExecResult> {
     // Update currentLine for $LINENO
     if (node.line !== undefined) {
@@ -547,14 +645,20 @@ export class Interpreter {
     // The aliasExpansionStack persists across iterations to prevent infinite loops.
     if (this.ctx.state.shoptOptions.expand_aliases && node.name) {
       let currentNode = node;
-      let maxExpansions = 100; // Safety limit
-      while (maxExpansions > 0) {
+      let expansionCount = 0;
+      while (true) {
         const expandedNode = this.expandAlias(currentNode);
         if (expandedNode === currentNode) {
           break; // No expansion occurred
         }
+        if (expansionCount >= this.ctx.limits.maxCallDepth) {
+          throw new ExecutionLimitError(
+            `alias expansion depth limit exceeded (${this.ctx.limits.maxCallDepth})`,
+            "recursion",
+          );
+        }
+        expansionCount++;
         currentNode = expandedNode;
-        maxExpansions--;
       }
       // Clear the alias expansion stack after all expansions are done
       this.aliasExpansionStack.clear();
@@ -567,6 +671,11 @@ export class Interpreter {
     // Clear expansion stderr at the start
     this.ctx.state.expansionStderr = "";
 
+    // A command with no command word reports the status of the last command
+    // substitution that ran inside it, so start every simple command with a
+    // clean marker rather than inheriting the previous command's.
+    this.ctx.state.lastSubstitutionExitCode = null;
+
     // Process all assignments (array, subscript, and scalar)
     const assignmentResult = await processAssignments(this.ctx, node);
     if (assignmentResult.error) {
@@ -574,7 +683,12 @@ export class Interpreter {
     }
     const tempAssignments = assignmentResult.tempAssignments;
     const xtraceAssignmentOutput = assignmentResult.xtraceOutput;
-
+    const restoreTempAssignments = (): void => {
+      for (const [name, value] of tempAssignments) {
+        if (value === undefined) this.ctx.state.env.delete(name);
+        else this.ctx.state.env.set(name, value);
+      }
+    };
     if (!node.name) {
       // No command name - could be assignment-only or redirect-only (bare redirects)
       // e.g., "x=5" (assignment-only) or "> file" (bare redirect to create empty file)
@@ -582,28 +696,57 @@ export class Interpreter {
       // Handle bare redirections (no command, just redirects like "> file")
       // In bash, this creates/truncates the file and returns success
       if (node.redirections.length > 0) {
-        // Process the redirects - this creates/truncates files as needed
-        const redirectError = await preOpenOutputRedirects(
+        const transaction = createRedirectionTransaction(
           this.ctx,
           node.redirections,
+          BARE_REDIRECTION_POLICY,
         );
-        if (redirectError) {
-          return redirectError;
+        onTransaction(transaction);
+        const preparedRedirections = await transaction.prepare(stdin);
+        if (preparedRedirections.error) {
+          restoreTempAssignments();
+          if (!preparedRedirections.errorCause) {
+            transaction.finish();
+            return preparedRedirections.error;
+          }
+          try {
+            return preparedRedirectionError(preparedRedirections);
+          } finally {
+            transaction.finish();
+          }
         }
-        // Apply redirections to empty result (for append, read redirects, etc.)
-        const baseResult = result("", xtraceAssignmentOutput, 0);
-        return applyRedirections(this.ctx, baseResult, node.redirections);
+        // After `prepare`, so a substitution in a redirection target counts.
+        const baseResult = result(
+          "",
+          xtraceAssignmentOutput,
+          nullCommandExitStatus(this.ctx.state, node.redirections),
+        );
+        const redirected = await applyRedirections(
+          this.ctx,
+          baseResult,
+          node.redirections,
+          preparedRedirections.targets,
+          preparedRedirections.dupSources,
+          preparedRedirections.standardRoutes,
+        );
+        transaction.finish();
+        return redirected;
       }
 
-      // Assignment-only command: preserve the exit code from command substitution
-      // e.g., x=$(false) should set $? to 1, not 0
+      // Assignment-only command: the status is the one from a command
+      // substitution in the values (`x=$(false)` is 1), and 0 when there was
+      // none — a bare `x=1` never re-reports the previous command's status.
       // Also clear $_ - bash clears it for bare assignments
       this.ctx.state.lastArg = "";
       // Include any stderr from command substitutions (e.g., FOO=$(echo foo 1>&2))
       const stderrOutput =
         (this.ctx.state.expansionStderr || "") + xtraceAssignmentOutput;
       this.ctx.state.expansionStderr = "";
-      return result("", stderrOutput, this.ctx.state.lastExitCode);
+      return result(
+        "",
+        stderrOutput,
+        nullCommandExitStatus(this.ctx.state, []),
+      );
     }
 
     // Mark prefix assignment variables as temporarily exported for this command
@@ -631,121 +774,20 @@ export class Interpreter {
       }
     }
 
-    // Process FD variable redirections ({varname}>file syntax)
-    // This allocates FDs and sets variables before command execution
-    const fdVarError = await processFdVariableRedirections(
-      this.ctx,
-      node.redirections,
-    );
-    if (fdVarError) {
-      for (const [name, value] of tempAssignments) {
-        if (value === undefined) this.ctx.state.env.delete(name);
-        else this.ctx.state.env.set(name, value);
-      }
-      return fdVarError;
-    }
-
-    // Track source FD for stdin from read-write file descriptors
-    // This allows the read builtin to update the FD's position after reading
-    let stdinSourceFd = -1;
-
-    for (const redir of node.redirections) {
-      if (
-        (redir.operator === "<<" || redir.operator === "<<-") &&
-        redir.target.type === "HereDoc"
-      ) {
-        const hereDoc = redir.target as HereDocNode;
-        let content = await expandWord(this.ctx, hereDoc.content);
-        // <<- strips leading tabs from each line
-        if (hereDoc.stripTabs) {
-          content = content
-            .split("\n")
-            .map((line) => line.replace(/^\t+/, ""))
-            .join("\n");
-        }
-        // Heredocs land here as JS Unicode text; the pipeline contract
-        // expects stdin to be a latin1 byte buffer. UTF-8 encode the
-        // text once at the source so byte consumers downstream see real
-        // bytes and binary writes don't truncate codepoints to their
-        // low byte.
-        content = latin1FromBytes(encodeUtf8ToBytes(content));
-        // If this is a non-standard fd (not 0), store in fileDescriptors for -u option
-        const fd = redir.fd ?? 0;
-        if (fd !== 0) {
-          if (!this.ctx.state.fileDescriptors) {
-            this.ctx.state.fileDescriptors = new Map();
-          }
-          checkFdLimit(this.ctx);
-          this.ctx.state.fileDescriptors.set(fd, content);
-        } else {
-          stdin = content;
-        }
-        continue;
-      }
-
-      if (redir.operator === "<<<" && redir.target.type === "Word") {
-        // Same byte-encoding step as heredoc — here-strings deliver
-        // JS Unicode text and need to land as bytes.
-        stdin = latin1FromBytes(
-          encodeUtf8ToBytes(
-            `${await expandWord(this.ctx, redir.target as WordNode)}\n`,
-          ),
-        );
-        continue;
-      }
-
-      if (redir.operator === "<" && redir.target.type === "Word") {
-        try {
-          const target = await expandWord(this.ctx, redir.target as WordNode);
-          const filePath = this.ctx.fs.resolvePath(this.ctx.state.cwd, target);
-          // Read as raw bytes — `<` is a transparent file-to-stdin
-          // pipe and we don't want the smart-utf8 read path turning
-          // valid bytes into U+FFFD replacement chars.
-          stdin = latin1FromBytes(await readBytesFrom(this.ctx.fs, filePath));
-        } catch {
-          const target = await expandWord(this.ctx, redir.target as WordNode);
-          for (const [name, value] of tempAssignments) {
-            if (value === undefined) this.ctx.state.env.delete(name);
-            else this.ctx.state.env.set(name, value);
-          }
-          return failure(`bash: ${target}: No such file or directory\n`);
-        }
-      }
-
-      // Handle <& input redirection from file descriptor
-      if (redir.operator === "<&" && redir.target.type === "Word") {
-        const target = await expandWord(this.ctx, redir.target as WordNode);
-        const sourceFd = Number.parseInt(target, 10);
-        if (!Number.isNaN(sourceFd) && this.ctx.state.fileDescriptors) {
-          const fdContent = this.ctx.state.fileDescriptors.get(sourceFd);
-          if (fdContent !== undefined) {
-            // Handle different FD content formats
-            if (fdContent.startsWith("__rw__:")) {
-              // Read/write mode: format is __rw__:pathLength:path:position:content
-              const parsed = parseRwFdContent(fdContent);
-              if (parsed) {
-                // Return content starting from current position
-                stdin = parsed.content.slice(parsed.position);
-                stdinSourceFd = sourceFd;
-              }
-            } else if (
-              fdContent.startsWith("__file__:") ||
-              fdContent.startsWith("__file_append__:")
-            ) {
-              // These are output-only, can't read from them
-            } else {
-              // Plain content (from exec N< file or here-docs)
-              stdin = fdContent;
-            }
-          }
-        }
-      }
-    }
-
-    const commandName = await expandWord(this.ctx, node.name);
+    let commandName = await expandWord(this.ctx, node.name);
 
     const args: string[] = [];
     const quotedArgs: boolean[] = [];
+    const appendArgument = (value: string, quoted: boolean): void => {
+      if (args.length >= this.ctx.limits.maxArrayElements) {
+        throw new ExecutionLimitError(
+          `expanded argument element limit exceeded (${this.ctx.limits.maxArrayElements})`,
+          "array_elements",
+        );
+      }
+      args.push(value);
+      quotedArgs.push(quoted);
+    };
 
     // Handle local/declare/export/readonly arguments specially:
     // - For array assignments like `local a=(1 "2 3")`, preserve quote structure
@@ -779,8 +821,7 @@ export class Interpreter {
           arg,
         );
         if (arrayAssignResult) {
-          args.push(arrayAssignResult);
-          quotedArgs.push(true);
+          appendArgument(arrayAssignResult, true);
         } else {
           // Check if this looks like a scalar assignment (name=value)
           // For assignments, we should NOT glob-expand the value part
@@ -789,14 +830,12 @@ export class Interpreter {
             arg,
           );
           if (scalarAssignResult !== null) {
-            args.push(scalarAssignResult);
-            quotedArgs.push(true);
+            appendArgument(scalarAssignResult, true);
           } else {
             // Not an assignment - use normal glob expansion
             const expanded = await expandWordWithGlob(this.ctx, arg);
             for (const value of expanded.values) {
-              args.push(value);
-              quotedArgs.push(expanded.quoted);
+              appendArgument(value, expanded.quoted);
             }
           }
         }
@@ -806,10 +845,43 @@ export class Interpreter {
       for (const arg of node.args) {
         const expanded = await expandWordWithGlob(this.ctx, arg);
         for (const value of expanded.values) {
-          args.push(value);
-          quotedArgs.push(expanded.quoted);
+          appendArgument(value, expanded.quoted);
         }
       }
+    }
+
+    const commandIsOnlyExpansions = node.name.parts.every(
+      (part) =>
+        part.type === "CommandSubstitution" ||
+        part.type === "ParameterExpansion" ||
+        part.type === "ArithmeticExpansion",
+    );
+    if (!commandName && commandIsOnlyExpansions && args.length > 0) {
+      commandName = args.shift() as string;
+      quotedArgs.shift();
+    }
+
+    const transaction = createRedirectionTransaction(
+      this.ctx,
+      node.redirections,
+      commandName === "exec"
+        ? EXEC_REDIRECTION_POLICY
+        : SIMPLE_REDIRECTION_POLICY,
+    );
+    onTransaction(transaction);
+    const preparedRedirections = await transaction.prepare(stdin);
+    if (preparedRedirections.error) {
+      restoreTempAssignments();
+      if (!preparedRedirections.errorCause) {
+        transaction.finish();
+        return preparedRedirections.error;
+      }
+      return preparedRedirectionError(preparedRedirections);
+    }
+    const stdinSourceFd = preparedRedirections.stdinSourceFd;
+    const stdinRedirected = preparedRedirections.stdin !== undefined;
+    if (preparedRedirections.stdin !== undefined) {
+      stdin = preparedRedirections.stdin;
     }
 
     // Handle empty command name specially
@@ -821,203 +893,24 @@ export class Interpreter {
     // - `true` X runs command X (since `true` outputs nothing)
     // However, a literal empty string (like '') is "command not found".
     if (!commandName) {
-      const isOnlyExpansions = node.name.parts.every(
-        (p) =>
-          p.type === "CommandSubstitution" ||
-          p.type === "ParameterExpansion" ||
-          p.type === "ArithmeticExpansion",
-      );
-      if (isOnlyExpansions) {
-        // Empty result from variable/command substitution - word split removes it
-        // If there are args, the first arg becomes the command name
-        if (args.length > 0) {
-          const newCommandName = args.shift() as string;
-          quotedArgs.shift();
-          return await this.runCommand(
-            newCommandName,
-            args,
-            quotedArgs,
-            stdin,
-            false,
-            false,
-            stdinSourceFd,
-          );
-        }
-        // No args - treat as no-op (status 0)
-        // Preserve lastExitCode for command subs like $(exit 42)
-        return result("", "", this.ctx.state.lastExitCode);
+      if (commandIsOnlyExpansions) {
+        // No args - treat as a no-op that reports the status of a command
+        // substitution in the word (`$(exit 42)` is 42) and 0 otherwise.
+        transaction.finish();
+        return result(
+          "",
+          "",
+          nullCommandExitStatus(this.ctx.state, node.redirections),
+        );
       }
       // Literal empty command name - command not found
+      transaction.finish();
       return failure("bash: : command not found\n", 127);
     }
 
     // Special handling for 'exec' with only redirections (no command to run)
     // In this case, the redirections apply persistently to the shell
     if (commandName === "exec" && (args.length === 0 || args[0] === "--")) {
-      // Process persistent FD redirections
-      // Note: {var}>file redirections are already handled by processFdVariableRedirections
-      // which sets up the FD mapping persistently. We only need to handle explicit fd redirections here.
-      for (const redir of node.redirections) {
-        if (redir.target.type === "HereDoc") continue;
-
-        // Skip FD variable redirections - already handled by processFdVariableRedirections
-        if (redir.fdVariable) continue;
-
-        const target = await expandWord(this.ctx, redir.target as WordNode);
-        const fd =
-          redir.fd ??
-          (redir.operator === "<" || redir.operator === "<>" ? 0 : 1);
-
-        if (!this.ctx.state.fileDescriptors) {
-          this.ctx.state.fileDescriptors = new Map();
-        }
-
-        switch (redir.operator) {
-          case ">":
-          case ">|": {
-            // Open file for writing (truncate)
-            const filePath = this.ctx.fs.resolvePath(
-              this.ctx.state.cwd,
-              target,
-            );
-            await this.ctx.fs.writeFile(filePath, "", "utf8"); // truncate
-            checkFdLimit(this.ctx);
-            this.ctx.state.fileDescriptors.set(fd, `__file__:${filePath}`);
-            break;
-          }
-          case ">>": {
-            // Open file for appending
-            const filePath = this.ctx.fs.resolvePath(
-              this.ctx.state.cwd,
-              target,
-            );
-            checkFdLimit(this.ctx);
-            this.ctx.state.fileDescriptors.set(
-              fd,
-              `__file_append__:${filePath}`,
-            );
-            break;
-          }
-          case "<": {
-            // Open file for reading - store its content
-            const filePath = this.ctx.fs.resolvePath(
-              this.ctx.state.cwd,
-              target,
-            );
-            try {
-              const content = await this.ctx.fs.readFile(filePath);
-              checkFdLimit(this.ctx);
-              this.ctx.state.fileDescriptors.set(fd, content);
-            } catch {
-              return failure(`bash: ${target}: No such file or directory\n`);
-            }
-            break;
-          }
-          case "<>": {
-            // Open file for read/write
-            // Format: __rw__:pathLength:path:position:content
-            // pathLength allows parsing paths with colons
-            // position tracks current file offset for read/write
-            const filePath = this.ctx.fs.resolvePath(
-              this.ctx.state.cwd,
-              target,
-            );
-            try {
-              const content = await this.ctx.fs.readFile(filePath);
-              checkFdLimit(this.ctx);
-              this.ctx.state.fileDescriptors.set(
-                fd,
-                `__rw__:${filePath.length}:${filePath}:0:${content}`,
-              );
-            } catch {
-              // File doesn't exist - create empty
-              await this.ctx.fs.writeFile(filePath, "", "utf8");
-              checkFdLimit(this.ctx);
-              this.ctx.state.fileDescriptors.set(
-                fd,
-                `__rw__:${filePath.length}:${filePath}:0:`,
-              );
-            }
-            break;
-          }
-          case ">&": {
-            // Duplicate output FD: N>&M means N now writes to same place as M
-            // Move FD: N>&M- means duplicate M to N, then close M
-            if (target === "-") {
-              // Close the FD
-              this.ctx.state.fileDescriptors.delete(fd);
-            } else if (target.endsWith("-")) {
-              // Move operation: N>&M- duplicates M to N then closes M
-              // Net-neutral on FD count (set + delete), skip checkFdLimit
-              const sourceFdStr = target.slice(0, -1);
-              const sourceFd = Number.parseInt(sourceFdStr, 10);
-              if (!Number.isNaN(sourceFd)) {
-                // First, duplicate: copy the FD content/info from source to target
-                const sourceInfo = this.ctx.state.fileDescriptors.get(sourceFd);
-                if (sourceInfo !== undefined) {
-                  this.ctx.state.fileDescriptors.set(fd, sourceInfo);
-                } else {
-                  // Source FD might be 1 (stdout) or 2 (stderr) which aren't in fileDescriptors
-                  // In that case, store as duplication marker
-                  this.ctx.state.fileDescriptors.set(
-                    fd,
-                    `__dupout__:${sourceFd}`,
-                  );
-                }
-                // Then close the source FD
-                this.ctx.state.fileDescriptors.delete(sourceFd);
-              }
-            } else {
-              const sourceFd = Number.parseInt(target, 10);
-              if (!Number.isNaN(sourceFd)) {
-                // Store FD duplication: fd N points to fd M
-                checkFdLimit(this.ctx);
-                this.ctx.state.fileDescriptors.set(
-                  fd,
-                  `__dupout__:${sourceFd}`,
-                );
-              }
-            }
-            break;
-          }
-          case "<&": {
-            // Duplicate input FD: N<&M means N now reads from same place as M
-            // Move FD: N<&M- means duplicate M to N, then close M
-            if (target === "-") {
-              // Close the FD
-              this.ctx.state.fileDescriptors.delete(fd);
-            } else if (target.endsWith("-")) {
-              // Move operation: N<&M- duplicates M to N then closes M
-              // Net-neutral on FD count (set + delete), skip checkFdLimit
-              const sourceFdStr = target.slice(0, -1);
-              const sourceFd = Number.parseInt(sourceFdStr, 10);
-              if (!Number.isNaN(sourceFd)) {
-                // First, duplicate: copy the FD content/info from source to target
-                const sourceInfo = this.ctx.state.fileDescriptors.get(sourceFd);
-                if (sourceInfo !== undefined) {
-                  this.ctx.state.fileDescriptors.set(fd, sourceInfo);
-                } else {
-                  // Source FD might be 0 (stdin) which isn't in fileDescriptors
-                  this.ctx.state.fileDescriptors.set(
-                    fd,
-                    `__dupin__:${sourceFd}`,
-                  );
-                }
-                // Then close the source FD
-                this.ctx.state.fileDescriptors.delete(sourceFd);
-              }
-            } else {
-              const sourceFd = Number.parseInt(target, 10);
-              if (!Number.isNaN(sourceFd)) {
-                // Store FD duplication for input
-                checkFdLimit(this.ctx);
-                this.ctx.state.fileDescriptors.set(fd, `__dupin__:${sourceFd}`);
-              }
-            }
-            break;
-          }
-        }
-      }
       // In bash, "exec" with only redirections does NOT persist prefix assignments
       // This is the "special case of the special case" - unlike other special builtins
       // (like ":"), exec without a command restores temp assignments
@@ -1031,16 +924,15 @@ export class Interpreter {
           this.ctx.state.tempExportedVars.delete(name);
         }
       }
+      transaction.finish();
       return OK;
     }
 
     // Append extra args injected via exec({ args }) and consume them
     if (this.ctx.state.extraArgs) {
-      args.push(...this.ctx.state.extraArgs);
-      for (let i = 0; i < this.ctx.state.extraArgs.length; i++) {
-        quotedArgs.push(true);
-      }
+      const extraArgs = this.ctx.state.extraArgs;
       this.ctx.state.extraArgs = undefined;
+      for (const extraArg of extraArgs) appendArgument(extraArg, true);
     }
 
     // Generate xtrace output before running the command
@@ -1066,6 +958,7 @@ export class Interpreter {
         false,
         false,
         stdinSourceFd,
+        stdinRedirected,
       );
     } catch (error) {
       // For break/continue, we still need to apply redirections before propagating
@@ -1078,6 +971,12 @@ export class Interpreter {
       }
     }
 
+    // Commands without stdin access leave descriptor input untouched. `read`
+    // advances its source exactly in consumeInput.
+    if (stdinSourceFd >= 0 && commandName !== "read") {
+      advanceFd(this.ctx, stdinSourceFd, cmdResult.internalStdinConsumed ?? 0);
+    }
+
     // Prepend xtrace output and any assignment warnings to stderr
     const stderrPrefix = xtraceAssignmentOutput + xtraceOutput;
     if (stderrPrefix) {
@@ -1087,7 +986,19 @@ export class Interpreter {
       };
     }
 
-    cmdResult = await applyRedirections(this.ctx, cmdResult, node.redirections);
+    // Descriptors opened by number stay visible while output is delivered
+    // (`echo hi 4> log >&4`), then go away with the command.
+    cmdResult = await applyRedirections(
+      this.ctx,
+      cmdResult,
+      node.redirections,
+      preparedRedirections.targets,
+      preparedRedirections.dupSources,
+      preparedRedirections.standardRoutes,
+      cmdResult.internalProducerCommand ?? commandName,
+      cmdResult.internalProducerOmitsShellPrefix,
+    );
+    transaction.finish();
 
     // If we caught a break/continue error, re-throw it after applying redirections
     if (controlFlowError) {
@@ -1174,11 +1085,12 @@ export class Interpreter {
     skipFunctions = false,
     useDefaultPath = false,
     stdinSourceFd = -1,
+    stdinRedirected = false,
   ): Promise<ExecResult> {
     const dispatchCtx: BuiltinDispatchContext = {
       ctx: this.ctx,
-      runCommand: (name, a, qa, s, sf, udp, ssf) =>
-        this.runCommand(name, a, qa, s, sf, udp, ssf),
+      runCommand: (name, a, qa, s, sf, udp, ssf, sr) =>
+        this.runCommand(name, a, qa, s, sf, udp, ssf, sr),
       buildExportedEnv: () => this.buildExportedEnv(),
       executeUserScript: (path, a, s) => this.executeUserScript(path, a, s),
     };
@@ -1193,27 +1105,34 @@ export class Interpreter {
       skipFunctions,
       useDefaultPath,
       stdinSourceFd,
+      stdinRedirected,
     );
 
-    if (builtinResult !== null) {
-      return builtinResult;
-    }
+    if (builtinResult !== null)
+      return builtinResult.internalProducerCommand === undefined
+        ? { ...builtinResult, internalProducerCommand: commandName }
+        : builtinResult;
 
     // Handle external command
-    return executeExternalCommand(
+    const externalResult = await executeExternalCommand(
       dispatchCtx,
       commandName,
       args,
       stdin,
       useDefaultPath,
     );
+    return { ...externalResult, internalProducerCommand: commandName };
   }
 
   // Alias expansion state
   private aliasExpansionStack: Set<string> = new Set();
 
   private expandAlias(node: SimpleCommandNode): SimpleCommandNode {
-    return expandAliasHelper(this.ctx.state, node, this.aliasExpansionStack);
+    return expandAliasHelper(
+      { env: this.ctx.state.env, limits: this.ctx.limits },
+      node,
+      this.aliasExpansionStack,
+    );
   }
 
   async findCommandInPath(commandName: string): Promise<string[]> {
@@ -1223,15 +1142,28 @@ export class Interpreter {
   private async executeSubshell(
     node: SubshellNode,
     stdin = "",
+    stdinOwned = false,
   ): Promise<ExecResult> {
-    return executeSubshellHelper(this.ctx, node, stdin, (stmt) =>
-      this.executeStatement(stmt),
+    return executeSubshellHelper(
+      this.ctx,
+      node,
+      stdin,
+      (stmt) => this.executeStatement(stmt),
+      stdinOwned,
     );
   }
 
-  private async executeGroup(node: GroupNode, stdin = ""): Promise<ExecResult> {
-    return executeGroupHelper(this.ctx, node, stdin, (stmt) =>
-      this.executeStatement(stmt),
+  private async executeGroup(
+    node: GroupNode,
+    stdin = "",
+    stdinOwned = false,
+  ): Promise<ExecResult> {
+    return executeGroupHelper(
+      this.ctx,
+      node,
+      stdin,
+      (stmt) => this.executeStatement(stmt),
+      stdinOwned,
     );
   }
 
@@ -1243,40 +1175,32 @@ export class Interpreter {
       this.ctx.state.currentLine = node.line;
     }
 
-    // Pre-open output redirects to truncate files BEFORE evaluating expression
-    // This matches bash behavior where redirect files are opened before
-    // any command substitutions in the arithmetic expression are evaluated
-    const preOpenError = await preOpenOutputRedirects(
+    return withPreparedRedirections(
       this.ctx,
       node.redirections,
+      "",
+      async () => {
+        try {
+          const arithResult = await evaluateArithmetic(
+            this.ctx,
+            node.expression.expression,
+          );
+          let bodyResult = testResult(arithResult !== 0);
+          if (this.ctx.state.expansionStderr) {
+            bodyResult = {
+              ...bodyResult,
+              stderr: this.ctx.state.expansionStderr + bodyResult.stderr,
+            };
+            this.ctx.state.expansionStderr = "";
+          }
+          return bodyResult;
+        } catch (error) {
+          return failure(
+            `bash: arithmetic expression: ${(error as Error).message}\n`,
+          );
+        }
+      },
     );
-    if (preOpenError) {
-      return preOpenError;
-    }
-
-    try {
-      const arithResult = await evaluateArithmetic(
-        this.ctx,
-        node.expression.expression,
-      );
-      // Apply output redirections
-      let bodyResult = testResult(arithResult !== 0);
-      // Include any stderr from expansion (e.g., command substitution stderr)
-      if (this.ctx.state.expansionStderr) {
-        bodyResult = {
-          ...bodyResult,
-          stderr: this.ctx.state.expansionStderr + bodyResult.stderr,
-        };
-        this.ctx.state.expansionStderr = "";
-      }
-      return applyRedirections(this.ctx, bodyResult, node.redirections);
-    } catch (error) {
-      // Apply output redirections before returning
-      const bodyResult = failure(
-        `bash: arithmetic expression: ${(error as Error).message}\n`,
-      );
-      return applyRedirections(this.ctx, bodyResult, node.redirections);
-    }
   }
 
   private async executeConditionalCommand(
@@ -1287,40 +1211,33 @@ export class Interpreter {
       this.ctx.state.currentLine = node.line;
     }
 
-    // Pre-open output redirects to truncate files BEFORE evaluating expression
-    // This matches bash behavior where redirect files are opened before
-    // any command substitutions in the conditional expression are evaluated
-    const preOpenError = await preOpenOutputRedirects(
+    return withPreparedRedirections(
       this.ctx,
       node.redirections,
+      "",
+      async () => {
+        try {
+          const condResult = await evaluateConditional(
+            this.ctx,
+            node.expression,
+          );
+          let bodyResult = testResult(condResult);
+          if (this.ctx.state.expansionStderr) {
+            bodyResult = {
+              ...bodyResult,
+              stderr: this.ctx.state.expansionStderr + bodyResult.stderr,
+            };
+            this.ctx.state.expansionStderr = "";
+          }
+          return bodyResult;
+        } catch (error) {
+          const exitCode = error instanceof ArithmeticError ? 1 : 2;
+          return failure(
+            `bash: conditional expression: ${(error as Error).message}\n`,
+            exitCode,
+          );
+        }
+      },
     );
-    if (preOpenError) {
-      return preOpenError;
-    }
-
-    try {
-      const condResult = await evaluateConditional(this.ctx, node.expression);
-      // Apply output redirections
-      let bodyResult = testResult(condResult);
-      // Include any stderr from expansion (e.g., bad array subscript warnings)
-      if (this.ctx.state.expansionStderr) {
-        bodyResult = {
-          ...bodyResult,
-          stderr: this.ctx.state.expansionStderr + bodyResult.stderr,
-        };
-        this.ctx.state.expansionStderr = "";
-      }
-      return applyRedirections(this.ctx, bodyResult, node.redirections);
-    } catch (error) {
-      // Apply output redirections before returning
-      // ArithmeticError (e.g., division by zero) returns exit code 1
-      // Other errors (e.g., invalid regex) return exit code 2
-      const exitCode = error instanceof ArithmeticError ? 1 : 2;
-      const bodyResult = failure(
-        `bash: conditional expression: ${(error as Error).message}\n`,
-        exitCode,
-      );
-      return applyRedirections(this.ctx, bodyResult, node.redirections);
-    }
   }
 }

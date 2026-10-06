@@ -30,12 +30,17 @@ import {
   ExecutionLimitError,
   ExitError,
 } from "../errors.js";
+import { getArrayElement, setArrayElement } from "../helpers/array.js";
 import { getIfsSeparator } from "../helpers/ifs.js";
 import { getNamerefTarget, isNameref } from "../helpers/nameref.js";
 import { escapeRegex } from "../helpers/regex.js";
 import type { InterpreterContext } from "../types.js";
 import { patternToRegex } from "./pattern.js";
-import { getVarNamesWithPrefix } from "./pattern-removal.js";
+import {
+  applyPatternRemoval,
+  getVarNamesWithPrefix,
+} from "./pattern-removal.js";
+import { applyPatternReplacementBounded } from "./pattern-replacement.js";
 import { expandPrompt } from "./prompt.js";
 import { quoteValue } from "./quoting.js";
 import { getArrayElements, getVariable, isArray } from "./variable.js";
@@ -100,6 +105,16 @@ export async function handleDefaultValue(
   return opCtx.effectiveValue;
 }
 
+export function assertDefaultAssignmentTarget(parameter: string): void {
+  if (/^(?:\d+|[@*#?$!-])$/.test(parameter)) {
+    throw new ExitError(
+      1,
+      "",
+      `bash: $${parameter}: cannot assign in this way\n`,
+    );
+  }
+}
+
 /**
  * Handle AssignDefault operation: ${param:=word}
  */
@@ -112,6 +127,9 @@ export async function handleAssignDefault(
 ): Promise<string> {
   ctx.coverage?.hit("bash:expansion:assign_default");
   const useDefault = opCtx.isUnset || (operation.checkEmpty && opCtx.isEmpty);
+  if (useDefault) {
+    assertDefaultAssignmentTarget(parameter);
+  }
   if (useDefault && operation.word) {
     const defaultValue = await expandWordPartsAsync(
       ctx,
@@ -122,6 +140,13 @@ export async function handleAssignDefault(
     const arrayMatch = parameter.match(/^([a-zA-Z_][a-zA-Z0-9_]*)\[(.+)\]$/);
     if (arrayMatch) {
       const [, arrayName, subscriptExpr] = arrayMatch;
+      if (subscriptExpr === "@" || subscriptExpr === "*") {
+        throw new ExitError(
+          1,
+          "",
+          `${ctx.state.expansionStderr || ""}bash: ${parameter}: bad array subscript\n`,
+        );
+      }
       // Evaluate subscript as arithmetic expression
       let index: number;
       if (/^\d+$/.test(subscriptExpr)) {
@@ -138,15 +163,7 @@ export async function handleAssignDefault(
         if (Number.isNaN(index)) index = 0;
       }
       // Set array element
-      ctx.state.env.set(`${arrayName}_${index}`, defaultValue);
-      // Update array length if needed
-      const currentLength = Number.parseInt(
-        ctx.state.env.get(`${arrayName}__length`) || "0",
-        10,
-      );
-      if (index >= currentLength) {
-        ctx.state.env.set(`${arrayName}__length`, String(index + 1));
-      }
+      setArrayElement(ctx, arrayName, index, defaultValue);
     } else {
       ctx.state.env.set(parameter, defaultValue);
     }
@@ -240,21 +257,13 @@ export async function handlePatternRemoval(
     }
   }
 
-  // Use 's' flag (dotall) so that . matches newlines (bash ? matches any char including newline)
-  if (operation.side === "prefix") {
-    return createUserRegex(`^${regexStr}`, "s").replace(value, "");
-  }
-  const regex = createUserRegex(`${regexStr}$`, "s");
-  if (operation.greedy) {
-    return regex.replace(value, "");
-  }
-  for (let i = value.length; i >= 0; i--) {
-    const suffix = value.slice(i);
-    if (regex.test(suffix)) {
-      return value.slice(0, i);
-    }
-  }
-  return value;
+  return applyPatternRemoval(
+    ctx,
+    value,
+    regexStr,
+    operation.side,
+    operation.greedy,
+  );
 }
 
 /**
@@ -314,35 +323,13 @@ export async function handlePatternReplacement(
 
   try {
     const re = createUserRegex(regex, flags);
-    if (operation.all) {
-      let result = "";
-      let lastIndex = 0;
-      let iterCount = 0;
-      const maxStringLen = ctx.limits.maxStringLength;
-      let match: RegExpExecArray | null = re.exec(value);
-      while (match !== null) {
-        if (match[0].length === 0 && match.index === value.length) {
-          break;
-        }
-        result += value.slice(lastIndex, match.index) + replacement;
-        lastIndex = match.index + match[0].length;
-        if (match[0].length === 0) {
-          lastIndex++;
-        }
-        // Check string length every 100 iterations to catch runaway growth
-        iterCount++;
-        if (iterCount % 100 === 0 && result.length > maxStringLen) {
-          throw new ExecutionLimitError(
-            `pattern replacement: string length limit exceeded (${maxStringLen} bytes)`,
-            "string_length",
-          );
-        }
-        match = re.exec(value);
-      }
-      result += value.slice(lastIndex);
-      return result;
-    }
-    return re.replace(value, replacement);
+    return applyPatternReplacementBounded(
+      ctx,
+      value,
+      re,
+      replacement,
+      operation.all,
+    );
   } catch (e) {
     if (e instanceof ExecutionLimitError) {
       throw e;
@@ -389,7 +376,7 @@ export function handleLength(
         firstElement !== undefined ? [...String(firstElement)].length : 0,
       );
     }
-    const firstElement = ctx.state.env.get(`${parameter}_0`) || "";
+    const firstElement = getArrayElement(ctx, parameter, 0) || "";
     return String([...firstElement].length);
   }
   // Use spread to count Unicode code points, not UTF-16 code units
@@ -786,18 +773,16 @@ export function computeIsEmpty(
       // - Quoted "${a[*]:-default}": uses default if IFS-joined result is empty
       // - Unquoted ${a[*]:-default}: like $*, only "empty" if array has no elements
       //   (even if IFS="" makes the joined expansion an empty string)
-      const ifsSep = getIfsSeparator(ctx.state.env);
-      const joined = elements.map(([, v]) => v).join(ifsSep);
       return {
-        isEmpty: inDoubleQuotes ? joined === "" : false,
-        effectiveValue: joined, // Use IFS-joined value instead of space-joined
+        isEmpty: inDoubleQuotes ? value === "" : false,
+        effectiveValue: value,
       };
     }
     // a[@] - empty only if all elements are empty AND there's exactly one
     // (similar to $@ behavior with single empty param)
     return {
       isEmpty: elements.length === 1 && elements.every(([, v]) => v === ""),
-      effectiveValue: elements.map(([, v]) => v).join(" "),
+      effectiveValue: value,
     };
   }
 

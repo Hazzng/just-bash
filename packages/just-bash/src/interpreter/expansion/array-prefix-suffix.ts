@@ -45,8 +45,9 @@ export type ExpandWordPartsAsyncFn = (
 ) => Promise<string>;
 
 /**
- * Handle "${arr[@]:-${default[@]}}", "${arr[@]:+${alt[@]}}", and "${arr[@]:=default}"
+ * Handle "${arr[@]:-${default[@]}}" and "${arr[@]:+${alt[@]}}".
  * Also handles "${var:-${default[@]}}" where var is a scalar variable.
+ * Assignment defaults preserve existing array elements when no assignment is needed.
  * When the default value contains an array expansion, each element should become a separate word.
  */
 export async function handleArrayDefaultValue(
@@ -69,6 +70,13 @@ export async function handleArrayDefaultValue(
   }
 
   const paramPart = dqPart.parts[0];
+  // The assignment handler owns rejection of positional and special targets.
+  if (
+    paramPart.operation?.type === "AssignDefault" &&
+    /^(?:\d+|[@*#?$!-])$/.test(paramPart.parameter)
+  ) {
+    return null;
+  }
   const op = paramPart.operation as
     | { type: "DefaultValue"; word?: WordNode; checkEmpty?: boolean }
     | { type: "UseAlternative"; word?: WordNode; checkEmpty?: boolean }
@@ -78,6 +86,9 @@ export async function handleArrayDefaultValue(
   const arrayMatch = paramPart.parameter.match(
     /^([a-zA-Z_][a-zA-Z0-9_]*)\[([@*])\]$/,
   );
+  if (op.type === "AssignDefault" && (!arrayMatch || arrayMatch[2] === "*")) {
+    return null;
+  }
 
   // Determine if we should use the alternate/default value
   let shouldUseAlternate: boolean;
@@ -121,7 +132,9 @@ export async function handleArrayDefaultValue(
     // Outer parameter is a scalar variable
     const varName = paramPart.parameter;
     const isSet = await isVariableSet(ctx, varName);
-    const varValue = await getVariable(ctx, varName);
+    // ${var:-word}, ${var:=word} and ${var:+word} all handle unset variables
+    // themselves, so nounset must not fire while probing the current value.
+    const varValue = await getVariable(ctx, varName, false);
     const isEmpty = varValue === "";
     const checkEmpty = op.checkEmpty ?? false;
 
@@ -135,6 +148,11 @@ export async function handleArrayDefaultValue(
     if (!shouldUseAlternate) {
       return { values: [varValue], quoted: true };
     }
+  }
+
+  // The assignment handler owns validation and evaluation before writing the target.
+  if (op.type === "AssignDefault") {
+    return null;
   }
 
   // We should use the alternate/default value
@@ -297,7 +315,7 @@ export async function handleArrayPatternWithPrefixSuffix(
     }
     // Apply pattern removal to each element
     values = values.map((value) =>
-      applyPatternRemoval(value, regexStr, op.side, op.greedy),
+      applyPatternRemoval(ctx, value, regexStr, op.side, op.greedy),
     );
   } else if (arrayOperation?.type === "PatternReplacement") {
     const op = arrayOperation as PatternReplacementOp;

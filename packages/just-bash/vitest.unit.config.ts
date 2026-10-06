@@ -18,12 +18,18 @@ export default defineConfig({
       "**/python-scripting*",
     ],
     setupFiles: [resolve(__dirname, "src/vitest-setup.ts")],
+    // guarded-fetch must be processed by vite-node rather than externalized so
+    // `vi.mock("node:dns/promises")` reaches its resolver, which is how
+    // dns-guarded-path.test.ts drives resolution without touching real DNS.
+    // Keep in sync with vitest.config.ts; that file asserts the mock is in
+    // force, so a config that omits this fails loudly rather than silently
+    // exercising real DNS.
+    server: { deps: { inline: ["guarded-fetch"] } },
     // Tests that patch globalThis (defense-in-depth) or spawn workers need
     // process-level isolation so they don't leak state into thread neighbours.
     poolMatchGlobs: [
       ["forks", "**/security/attacks/**"],
-      ["forks", "**/security/defense-in-depth-box*.test.ts"],
-      ["forks", "**/security/defense-in-depth-hardening.test.ts"],
+      ["forks", "**/security/defense-in-depth*.test.ts"],
       ["forks", "**/security/sandbox/**"],
       ["forks", "**/sqlite3.worker-protocol-abuse.test.ts"],
       ["forks", "**/python3.worker-protocol-abuse.test.ts"],

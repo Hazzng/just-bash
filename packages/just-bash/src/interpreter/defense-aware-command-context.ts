@@ -1,5 +1,5 @@
 import { assertDefenseContext } from "../security/defense-context.js";
-import type { CommandContext } from "../types.js";
+import type { RuntimeCommandContext } from "../types.js";
 
 function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
   return (
@@ -47,11 +47,11 @@ function wrapFunction<TArgs extends unknown[], TResult>(
 }
 
 function wrapFileSystem(
-  fs: CommandContext["fs"],
+  fs: RuntimeCommandContext["fs"],
   requireDefenseContext: boolean | undefined,
   component: string,
-): CommandContext["fs"] {
-  const wrappedFs: CommandContext["fs"] = {
+): RuntimeCommandContext["fs"] {
+  const wrappedFs: RuntimeCommandContext["fs"] = {
     readFile: wrapFunction(
       fs.readFile.bind(fs),
       requireDefenseContext,
@@ -184,6 +184,20 @@ function wrapFileSystem(
     );
   }
 
+  // createExclusive is optional on IFileSystem, and dropping it here would be
+  // silent and security-relevant: callers treat an absent method as a
+  // filesystem that cannot create atomically, so an unwrapped method would
+  // make mktemp fail outright under defense-in-depth — the configuration
+  // where the atomic path matters most.
+  if (fs.createExclusive) {
+    wrappedFs.createExclusive = wrapFunction(
+      fs.createExclusive.bind(fs),
+      requireDefenseContext,
+      component,
+      "fs.createExclusive",
+    );
+  }
+
   return wrappedFs;
 }
 
@@ -192,18 +206,25 @@ function wrapFileSystem(
  * context is expected but missing.
  */
 export function createDefenseAwareCommandContext(
-  ctx: CommandContext,
+  ctx: RuntimeCommandContext,
   commandName: string,
-): CommandContext {
+): RuntimeCommandContext {
   if (!ctx.requireDefenseContext) {
     return ctx;
   }
 
   const component = `command:${commandName}`;
-  const wrappedCtx: CommandContext = {
-    ...ctx,
-    fs: wrapFileSystem(ctx.fs, ctx.requireDefenseContext, component),
+  const descriptors = Object.getOwnPropertyDescriptors(ctx);
+  descriptors.fs = {
+    value: wrapFileSystem(ctx.fs, ctx.requireDefenseContext, component),
+    enumerable: true,
+    configurable: true,
+    writable: true,
   };
+  const wrappedCtx = Object.defineProperties(
+    Object.create(Object.getPrototypeOf(ctx)),
+    descriptors,
+  ) as RuntimeCommandContext;
 
   if (ctx.exec) {
     wrappedCtx.exec = wrapFunction(
@@ -211,6 +232,15 @@ export function createDefenseAwareCommandContext(
       ctx.requireDefenseContext,
       component,
       "exec",
+    );
+  }
+
+  if (ctx.origCommand) {
+    wrappedCtx.origCommand = wrapFunction(
+      ctx.origCommand,
+      ctx.requireDefenseContext,
+      component,
+      "origCommand",
     );
   }
 

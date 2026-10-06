@@ -8,6 +8,7 @@
 import {
   AST,
   type CommandSubstitutionPart,
+  type ProcessSubstitutionPart,
   type ScriptNode,
 } from "../ast/types.js";
 
@@ -141,9 +142,10 @@ export function isDollarDparenSubshell(value: string, start: number): boolean {
 
 /**
  * Read a heredoc delimiter starting at `pos` (the first character after the
- * `<<` / `<<-` operator and any leading blanks). Returns the *unquoted*
- * delimiter — the exact string a terminator line must equal — and the index
- * just past the delimiter token.
+ * `<<` / `<<-` operator and any leading blanks). Returns the delimiter after
+ * outer-word quote removal, plus metadata needed by both the lexer and nested
+ * substitution scanner. Syntax inside unexpanded `$(`, `<(`, and `>(` atoms
+ * remains literal.
  *
  * Quoting only controls whether the body is expanded, which is irrelevant to
  * finding the substitution boundary, so `'EOF'`, `"EOF"`, and `\EOF` all yield
@@ -152,9 +154,18 @@ export function isDollarDparenSubshell(value: string, start: number): boolean {
 export function readHeredocDelimiter(
   value: string,
   pos: number,
-): { delim: string; endPos: number } {
+): {
+  delim: string;
+  endPos: number;
+  quoted: boolean;
+  unclosedQuote: "'" | '"' | undefined;
+  unclosedSubstitution: boolean;
+} {
   let delim = "";
   let i = pos;
+  let substitutionDepth = 0;
+  let quoted = false;
+  let unclosedQuote: "'" | '"' | undefined;
   const isWordEnd = (c: string): boolean =>
     c === " " ||
     c === "\t" ||
@@ -169,6 +180,9 @@ export function readHeredocDelimiter(
   while (i < value.length) {
     const c = value[i];
     if (c === "'") {
+      const nested = substitutionDepth > 0;
+      if (!nested) quoted = true;
+      if (nested) delim += c;
       i++;
       while (i < value.length && value[i] !== "'") {
         delim += value[i];
@@ -176,34 +190,90 @@ export function readHeredocDelimiter(
       }
       // Skip the closing quote, but only if it is actually present so an
       // unterminated delimiter cannot push `endPos` past the end of the string.
-      if (i < value.length) i++;
+      if (i < value.length) {
+        if (nested) delim += value[i];
+        i++;
+      } else {
+        unclosedQuote = c;
+      }
       continue;
     }
     if (c === '"') {
+      const nested = substitutionDepth > 0;
+      if (!nested) quoted = true;
+      if (nested) delim += c;
       i++;
       while (i < value.length && value[i] !== '"') {
         if (value[i] === "\\" && i + 1 < value.length) {
-          i++;
+          if (nested) {
+            delim += value.slice(i, i + 2);
+            i += 2;
+            continue;
+          }
+          const escaped = value[i + 1];
+          if (
+            escaped === "$" ||
+            escaped === "`" ||
+            escaped === '"' ||
+            escaped === "\\" ||
+            escaped === "\n"
+          ) {
+            i += 2;
+            if (escaped !== "\n") delim += escaped;
+            continue;
+          }
         }
         delim += value[i];
         i++;
       }
       // Skip the closing quote only if present (see single-quote note above).
-      if (i < value.length) i++;
+      if (i < value.length) {
+        if (nested) delim += value[i];
+        i++;
+      } else {
+        unclosedQuote = c;
+      }
       continue;
     }
     if (c === "\\" && i + 1 < value.length) {
-      delim += value[i + 1];
+      if (substitutionDepth > 0) {
+        delim += value.slice(i, i + 2);
+        i += 2;
+        continue;
+      }
+      quoted = true;
+      const escaped = value[i + 1];
+      if (escaped !== "\n") delim += escaped;
       i += 2;
       continue;
     }
-    if (isWordEnd(c)) {
+    if (
+      substitutionDepth === 0 &&
+      (c === "$" || c === "<" || c === ">") &&
+      value[i + 1] === "("
+    ) {
+      delim += `${c}(`;
+      substitutionDepth = 1;
+      i += 2;
+      continue;
+    }
+    if (substitutionDepth === 0 && isWordEnd(c)) {
       break;
+    }
+    if (substitutionDepth > 0) {
+      if (c === "(") substitutionDepth++;
+      else if (c === ")") substitutionDepth--;
     }
     delim += c;
     i++;
   }
-  return { delim, endPos: i };
+  return {
+    delim,
+    endPos: i,
+    quoted,
+    unclosedQuote,
+    unclosedSubstitution: substitutionDepth > 0,
+  };
 }
 
 /**
@@ -253,23 +323,22 @@ function skipHeredocBodies(
 }
 
 /**
- * Parse a command substitution starting at the given position.
- * Handles $(...) syntax with proper depth tracking for nested substitutions.
+ * Find the index of the `)` that closes a parenthesised substitution body.
+ *
+ * Used for `$(...)` command substitution embedded in a word, where the lexer
+ * cannot expose the body as ordinary grammar tokens. Process substitution is
+ * parsed directly from the token stream instead.
  *
  * @param value The string containing the substitution
- * @param start Position of the `$` in `$(`
- * @param createParser Factory function to create a new parser instance
+ * @param cmdStart Index of the first character after the opening `X(`
  * @param error Error reporting function
- * @returns The parsed command substitution part and the ending index
+ * @returns Index of the closing `)` in `value`
  */
-export function parseCommandSubstitutionFromString(
+function findSubstitutionBodyEnd(
   value: string,
-  start: number,
-  createParser: ParserFactory,
+  cmdStart: number,
   error: ErrorFn,
-): { part: CommandSubstitutionPart; endIndex: number } {
-  // Skip $(
-  const cmdStart = start + 2;
+): number {
   let depth = 1;
   let i = cmdStart;
 
@@ -328,7 +397,16 @@ export function parseCommandSubstitutionFromString(
         while (value[p] === " " || value[p] === "\t") {
           p++;
         }
-        const { delim, endPos } = readHeredocDelimiter(value, p);
+        const { delim, endPos, unclosedQuote, unclosedSubstitution } =
+          readHeredocDelimiter(value, p);
+        if (unclosedQuote) {
+          error(
+            `unexpected EOF while looking for matching \`${unclosedQuote}'`,
+          );
+        }
+        if (unclosedSubstitution) {
+          error("unexpected EOF while looking for matching `)'");
+        }
         if (delim.length > 0) {
           pendingHeredocs.push({ delim, stripTabs });
           wordBuffer = "";
@@ -398,10 +476,33 @@ export function parseCommandSubstitutionFromString(
     if (depth > 0) i++;
   }
 
-  // Check for unclosed command substitution
+  // Check for unclosed substitution
   if (depth > 0) {
     error("unexpected EOF while looking for matching `)'");
   }
+
+  return i;
+}
+
+/**
+ * Parse a command substitution starting at the given position.
+ * Handles $(...) syntax with proper depth tracking for nested substitutions.
+ *
+ * @param value The string containing the substitution
+ * @param start Position of the `$` in `$(`
+ * @param createParser Factory function to create a new parser instance
+ * @param error Error reporting function
+ * @returns The parsed command substitution part and the ending index
+ */
+export function parseCommandSubstitutionFromString(
+  value: string,
+  start: number,
+  createParser: ParserFactory,
+  error: ErrorFn,
+): { part: CommandSubstitutionPart; endIndex: number } {
+  // Skip $(
+  const cmdStart = start + 2;
+  const i = findSubstitutionBodyEnd(value, cmdStart, error);
 
   const cmdStr = value.slice(cmdStart, i);
   // Use a new Parser instance to avoid overwriting the caller's parser's tokens
@@ -411,6 +512,24 @@ export function parseCommandSubstitutionFromString(
   return {
     part: AST.commandSubstitution(body, false),
     endIndex: i + 1,
+  };
+}
+
+/** Parse process substitution syntax found inside a recursively parsed word fragment. */
+export function parseProcessSubstitutionFromString(
+  value: string,
+  start: number,
+  createParser: ParserFactory,
+  error: ErrorFn,
+): { part: ProcessSubstitutionPart; endIndex: number } {
+  const direction = value[start] === "<" ? "input" : "output";
+  const bodyStart = start + 2;
+  const bodyEnd = findSubstitutionBodyEnd(value, bodyStart, error);
+  const body = createParser().parse(value.slice(bodyStart, bodyEnd));
+
+  return {
+    part: AST.processSubstitution(body, direction),
+    endIndex: bodyEnd + 1,
   };
 }
 
