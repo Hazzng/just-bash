@@ -13,6 +13,38 @@ async function expectNodeOutput(source: string) {
   expect(result.exitCode).toBe(0);
 }
 
+describe("Buffer UTF-8 encoding compatibility", () => {
+  it("matches Node for malformed UTF-16 and bounded writes", async () => {
+    const cases = [
+      "\uD800",
+      "\uDBFF",
+      "\uDC00",
+      "\uDFFF",
+      "\uD800A",
+      "\uD800\uD800",
+      "\uDC00\uD800",
+      "\uD800\uD800\uDC00",
+      "A\uDFFFZ",
+      "\uD800\uDC00",
+      "\uDBFF\uDFFF",
+      "aé€😀z",
+    ];
+    await expectNodeOutput(`
+      var cases = ${JSON.stringify(cases)};
+      console.log(JSON.stringify(cases.map(function(value) {
+        var writes = [];
+        for (var length = 0; length <= Buffer.byteLength(value) + 1; length++) {
+          var buffer = Buffer.alloc(length + 2, 0x61);
+          var written = buffer.write(value, 1, length, 'utf8');
+          writes.push([written, buffer.toString('hex')]);
+        }
+        return [Buffer.from(value, 'utf8').toString('hex'),
+          Buffer.byteLength(value, 'utf8'), writes];
+      })));
+    `);
+  });
+});
+
 describe("Buffer UTF-8 decoding compatibility", () => {
   it("matches Node for malformed sequences and valid Unicode boundaries", async () => {
     const cases = [

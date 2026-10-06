@@ -263,10 +263,15 @@ function _utf8Encode(str) {
       bytes.push(c);
     } else if (c < 0x800) {
       bytes.push(0xC0 | (c >> 6), 0x80 | (c & 0x3F));
-    } else if (c >= 0xD800 && c <= 0xDBFF && i + 1 < str.length) {
-      var lo = str.charCodeAt(++i);
-      var cp = ((c - 0xD800) * 0x400) + (lo - 0xDC00) + 0x10000;
-      bytes.push(0xF0 | (cp >> 18), 0x80 | ((cp >> 12) & 0x3F), 0x80 | ((cp >> 6) & 0x3F), 0x80 | (cp & 0x3F));
+    } else if (c >= 0xD800 && c <= 0xDFFF) {
+      var lo = str.charCodeAt(i + 1);
+      if (c <= 0xDBFF && lo >= 0xDC00 && lo <= 0xDFFF) {
+        i++;
+        var cp = ((c - 0xD800) * 0x400) + (lo - 0xDC00) + 0x10000;
+        bytes.push(0xF0 | (cp >> 18), 0x80 | ((cp >> 12) & 0x3F), 0x80 | ((cp >> 6) & 0x3F), 0x80 | (cp & 0x3F));
+      } else {
+        bytes.push(0xEF, 0xBF, 0xBD);
+      }
     } else {
       bytes.push(0xE0 | (c >> 12), 0x80 | ((c >> 6) & 0x3F), 0x80 | (c & 0x3F));
     }
