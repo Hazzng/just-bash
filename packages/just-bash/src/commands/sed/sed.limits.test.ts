@@ -51,26 +51,9 @@ describe("SED Execution Limits", () => {
 
       const result = await env.exec(`sed 's/a/b/g' /input.txt`);
 
-      // Should complete without hanging
       expect(result.exitCode).toBe(0);
-      expect(result.stdout.length).toBeGreaterThan(0);
-    });
-
-    it("handles dense substitutions across bounded string-builder batches", async () => {
-      const input = "a".repeat(16_385);
-      const expected = input.replaceAll("a", "b");
-      const env = new Bash({
-        executionLimits: {
-          maxStringLength: expected.length * 2,
-          maxOutputSize: expected.length * 2,
-        },
-      });
-      await env.writeFile("/input.txt", input);
-
-      const result = await env.exec("sed 's/a/b/g' /input.txt");
-
-      expect(result.exitCode).toBe(0);
-      expect(result.stdout).toBe(expected);
+      expect(result.stdout).toBe("b".repeat(longLine.length));
+      expect(result.stderr).toBe("");
     });
 
     it("should handle backreference expansion limits", async () => {

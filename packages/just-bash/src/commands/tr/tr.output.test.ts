@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { Bash } from "../../Bash.js";
 import { ExecutionLimitError } from "../../interpreter/errors.js";
@@ -42,10 +41,7 @@ describe("tr output construction", () => {
     const env = new Bash({ files: {}, cwd: "/" });
 
     const translated = await env.exec("tr x y", { stdin: input });
-    expect(translated.stdout).toHaveLength(input.length);
-    expect(createHash("sha256").update(translated.stdout).digest("hex")).toBe(
-      createHash("sha256").update("y".repeat(input.length)).digest("hex"),
-    );
+    expect(translated.stdout).toBe("y".repeat(input.length));
     expect(translated.stderr).toBe("");
     expect(translated.exitCode).toBe(0);
 

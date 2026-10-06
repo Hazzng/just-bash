@@ -1,6 +1,10 @@
 const STRING_CHUNK_SIZE = 8192;
 
-/** Build strings in bounded batches to avoid long ropes of single-character appends. */
+/**
+ * Batch fragments to avoid long ropes of single-character appends.
+ * Only the fragment count per batch is bounded, not fragment size or total output.
+ * Callers enforce output-byte budgets; BoundedStringBuilder owns that separate contract.
+ */
 export function createStringBuilder(inlineFragments = 0): {
   append: (value: string) => void;
   finish: () => string;

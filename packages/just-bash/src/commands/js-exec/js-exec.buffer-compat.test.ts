@@ -39,6 +39,7 @@ describe("Buffer UTF-8 encoding compatibility", () => {
           writes.push([written, buffer.toString('hex')]);
         }
         return [Buffer.from(value, 'utf8').toString('hex'),
+          Buffer.from(value, 'utf8').toString('utf8'),
           Buffer.byteLength(value, 'utf8'), writes];
       })));
     `);

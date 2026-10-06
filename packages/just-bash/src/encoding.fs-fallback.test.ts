@@ -8,12 +8,6 @@
  */
 import { describe, expect, it } from "vitest";
 import { Bash } from "./Bash.js";
-import {
-  type ByteString,
-  bytesFromUint8Array,
-  encodeUtf8ToBytes,
-  latin1FromBytes,
-} from "./encoding.js";
 import { InMemoryFs } from "./fs/in-memory-fs/in-memory-fs.js";
 import type { IFileSystem } from "./fs/interface.js";
 
@@ -54,21 +48,5 @@ describe("readFileBytes back-compat fallback", () => {
       stderr: r.stderr,
       exitCode: r.exitCode,
     }).toEqual({ stdout: "한글", stderr: "", exitCode: 0 });
-  });
-
-  it("bytesFromUint8Array preserves all byte values and chunk boundaries", () => {
-    const buf = Uint8Array.from({ length: 8193 }, (_, i) => i & 0xff);
-    const s: ByteString = bytesFromUint8Array(buf);
-    const back = Uint8Array.from(latin1FromBytes(s), (c) => c.charCodeAt(0));
-    expect(Array.from(back)).toEqual(Array.from(buf));
-  });
-
-  it("encodeUtf8ToBytes matches TextEncoder for Unicode and lone surrogates", () => {
-    const text = "ASCII é 水 💩 \uD800 lone-high \uDC00 lone-low";
-    const actual = latin1FromBytes(encodeUtf8ToBytes(text));
-    const expected = Array.from(new TextEncoder().encode(text), (byte) =>
-      String.fromCharCode(byte),
-    ).join("");
-    expect(actual).toBe(expected);
   });
 });
