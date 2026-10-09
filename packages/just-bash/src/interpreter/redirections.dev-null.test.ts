@@ -44,6 +44,13 @@ const cases: [script: string, stdout: string, stderr?: string][] = [
   ["echo x &> /dev/stderr; echo after", "after\n", "x\n"],
   ["echo x &>> /dev/stdout; echo after", "x\nafter\n"],
   ["echo x 2> /dev/stdout; echo after", "x\nafter\n"],
+  ["echo hi > /out 3> /dev/stdout >&3; echo [$(cat /out)]", "[hi]\n"],
+  ["(exec > /out; exec > /dev/stdout; echo hi); echo [$(cat /out)]", "[hi]\n"],
+  [
+    "(exec > /out; set -o noclobber; echo x > /dev/stdout; echo rc=$? >&2); cat /out",
+    "",
+    "bash: /dev/stdout: cannot overwrite existing file\nrc=1\n",
+  ],
 ];
 
 describe("/dev redirections on a filesystem without /dev", () => {
@@ -61,6 +68,18 @@ describe("/dev redirections on the default filesystem", () => {
     ["cd /dev && echo x > null; wc -c < /dev/null", "0\n"],
     ["cd /dev && echo x > stdout", "x\n"],
     ["set -o noclobber; echo x > /dev/stdout; echo rc=$?", "x\nrc=0\n"],
+    [
+      "mkdir /tmp/w && cd /tmp/w && { cd /dev; echo hi; } > stdout; echo [$(cat /tmp/w/stdout)]",
+      "[hi]\n",
+    ],
+    [
+      "mkdir /tmp/w && cd /tmp/w && f() { cd /dev; echo hi; }; f > null; echo [$(cat /tmp/w/null)]",
+      "[hi]\n",
+    ],
+    [
+      "(exec > /tmp/out; cd /dev; exec > stdout; echo hi); echo [$(cat /tmp/out)]",
+      "[hi]\n",
+    ],
   ])("%s", async (script, stdout, stderr = "") => {
     const result = await new Bash().exec(script);
     expect(result).toMatchObject({ stdout, stderr, exitCode: 0 });
