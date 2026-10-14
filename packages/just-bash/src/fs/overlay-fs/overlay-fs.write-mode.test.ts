@@ -75,4 +75,26 @@ describe("OverlayFs keeps a file's mode when it is overwritten", () => {
     expect(stat.isFile).toBe(true);
     expect(stat.mode).toBe(0o644);
   });
+
+  it("clears set-user-ID when > truncates a lower-layer file", async () => {
+    fs.chmodSync(path.join(root, "low.sh"), 0o4755);
+    await overlay.writeFile("/low.sh", "new");
+    expect((await overlay.stat("/low.sh")).mode).toBe(0o755);
+  });
+
+  it("keeps set-user-ID when an empty >> opens a lower-layer file", async () => {
+    fs.chmodSync(path.join(root, "low.sh"), 0o4755);
+    await overlay.appendFile("/low.sh", "");
+    expect((await overlay.stat("/low.sh")).mode).toBe(0o4755);
+  });
+
+  it("gives mv's destination the source's mode", async () => {
+    const result = await bash.exec(`
+      echo a > tmp.sh
+      mv tmp.sh low.sh; stat -c '%a' low.sh
+      chmod 755 low.sh; mv low.sh new.sh; stat -c '%a' new.sh
+    `);
+    expect(result.stderr).toBe("");
+    expect(result.stdout).toBe("644\n755\n");
+  });
 });
