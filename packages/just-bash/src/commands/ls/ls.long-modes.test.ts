@@ -67,6 +67,26 @@ describe("ls -l mode column", () => {
     expect(result.exitCode).toBe(0);
   });
 
+  it("builds the .. row of a symlinked directory from its target's parent", async () => {
+    const env = new Bash();
+    const result = await env.exec(
+      "mkdir -p /p/c /a && chmod 711 /p && chmod 700 /p/c && ln -s /p/c /link && ln -s /p/c /a/link && ls -la /link; ls -la /a/link; cd /link && ls -la",
+    );
+    expect(modeAndName(result.stdout)).toEqual([
+      "total 2",
+      "drwx------ .",
+      "drwx--x--x ..",
+      "total 2",
+      "drwx------ .",
+      "drwx--x--x ..",
+      "total 2",
+      "drwx------ .",
+      "drwx--x--x ..",
+    ]);
+    expect(result.stderr).toBe("");
+    expect(result.exitCode).toBe(0);
+  });
+
   it("builds both the . and .. rows of / from / itself", async () => {
     const env = new Bash();
     const result = await env.exec("chmod 750 / && ls -la /");
