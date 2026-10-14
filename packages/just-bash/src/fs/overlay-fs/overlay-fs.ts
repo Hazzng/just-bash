@@ -571,6 +571,7 @@ export class OverlayFs implements IFileSystem {
     validatePath(path, "write");
     this.assertWritable(`write '${path}'`);
     const normalized = normalizePath(path);
+    const mode = await this.modeForWrite(normalized);
     this.ensureParentDirs(normalized);
 
     const encoding = getEncoding(options);
@@ -579,10 +580,22 @@ export class OverlayFs implements IFileSystem {
     this.setMemoryEntry(normalized, {
       type: "file",
       content: buffer,
-      mode: DEFAULT_FILE_MODE,
+      mode,
       mtime: new Date(),
     });
     this.deleted.delete(normalized);
+  }
+
+  // Like open(O_TRUNC), replacing a file's content keeps its permissions.
+  // lstat sees deletions and does not follow a lower-layer symlink. A
+  // lower-layer mode carries file-type bits, so keep only permissions.
+  private async modeForWrite(normalized: string): Promise<number> {
+    try {
+      const stat = await this.lstat(normalized);
+      return stat.isFile ? stat.mode & 0o7777 : DEFAULT_FILE_MODE;
+    } catch {
+      return DEFAULT_FILE_MODE;
+    }
   }
 
   async appendFile(
@@ -614,13 +627,14 @@ export class OverlayFs implements IFileSystem {
     } catch {
       existingBuffer = new Uint8Array(0);
     }
+    const mode = await this.modeForWrite(normalized);
 
     this.ensureParentDirs(normalized);
     this.setMemoryEntry(normalized, {
       type: "file",
       content: existingBuffer,
       appendChunks: [newBuffer],
-      mode: DEFAULT_FILE_MODE,
+      mode,
       mtime: new Date(),
     });
     this.deleted.delete(normalized);

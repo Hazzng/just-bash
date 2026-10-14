@@ -270,9 +270,15 @@ export class InMemoryFs implements IFileSystem {
     this.setEntry(normalized, {
       type: "file",
       content: buffer,
-      mode: metadata?.mode ?? DEFAULT_FILE_MODE,
+      mode: metadata?.mode ?? this.modeForWrite(normalized),
       mtime: metadata?.mtime ?? new Date(),
     });
+  }
+
+  // Like open(O_TRUNC), replacing a file's content keeps its permissions.
+  private modeForWrite(normalized: string): number {
+    const existing = this.data.get(normalized);
+    return existing?.type === "file" ? existing.mode : DEFAULT_FILE_MODE;
   }
 
   /**
@@ -291,7 +297,7 @@ export class InMemoryFs implements IFileSystem {
     this.setEntry(normalized, {
       type: "file",
       lazy,
-      mode: metadata?.mode ?? DEFAULT_FILE_MODE,
+      mode: metadata?.mode ?? this.modeForWrite(normalized),
       mtime: metadata?.mtime ?? new Date(),
     });
   }
