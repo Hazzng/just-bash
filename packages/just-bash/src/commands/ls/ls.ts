@@ -579,7 +579,10 @@ async function listPath(
           entry === "." || fullPath === "/"
             ? stat
             : await ctx.fs
-                .stat(fullPath.slice(0, fullPath.lastIndexOf("/")) || "/")
+                .realpath(fullPath)
+                .then((real) =>
+                  ctx.fs.stat(real.slice(0, real.lastIndexOf("/")) || "/"),
+                )
                 .catch(() => undefined);
         if (!dirStat) {
           stdout = appendLsOutput(
