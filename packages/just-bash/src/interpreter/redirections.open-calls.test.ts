@@ -42,30 +42,126 @@ async function callsFor(
   return calls;
 }
 
+const WARM = "echo seed > existing.log; printf '' > /dev/null; cat < /dev/null";
+
 describe("backend calls per output redirect", () => {
-  it("opens `> existing` with one stat and the pre-open write", async () => {
-    expect(await callsFor("echo r > existing.log")).toEqual([
-      'stat("/home/user/existing.log")',
-      'writeFile("/home/user/existing.log","")',
-      'stat("/usr/bin/echo")',
-      'writeFile("/home/user/existing.log","r\\n")',
-    ]);
-  });
-
-  it("opens `>> existing` with one stat and the pre-open append", async () => {
-    expect(await callsFor("echo r >> existing.log")).toEqual([
-      'stat("/home/user/existing.log")',
-      'appendFile("/home/user/existing.log","")',
-      'stat("/usr/bin/echo")',
-      'appendFile("/home/user/existing.log","r\\n")',
-    ]);
-  });
-
   it("truncates `: > f` with one stat and one write", async () => {
     expect(await callsFor(": > existing.log")).toEqual([
       'stat("/home/user/existing.log")',
       'writeFile("/home/user/existing.log","")',
     ]);
+  });
+
+  it.each([
+    [
+      "echo r > existing.log",
+      [
+        'stat("/home/user/existing.log")',
+        'stat("/usr/bin/echo")',
+        'writeFile("/home/user/existing.log","r\\n")',
+      ],
+    ],
+    [
+      "echo r >> existing.log",
+      [
+        'stat("/home/user/existing.log")',
+        'stat("/usr/bin/echo")',
+        'appendFile("/home/user/existing.log","r\\n")',
+      ],
+    ],
+    [
+      "echo r > new.txt",
+      [
+        'stat("/home/user/new.txt")',
+        'stat("/usr/bin/echo")',
+        'writeFile("/home/user/new.txt","r\\n")',
+      ],
+    ],
+    [
+      "printf '%s\\n' x >> existing.log",
+      [
+        'stat("/home/user/existing.log")',
+        'stat("/usr/bin/printf")',
+        'appendFile("/home/user/existing.log","x\\n")',
+      ],
+    ],
+    [
+      "cat <<EOF > heredoc.txt\nr\nEOF",
+      [
+        'stat("/home/user/heredoc.txt")',
+        'stat("/usr/bin/cat")',
+        'writeFile("/home/user/heredoc.txt","r\\n")',
+      ],
+    ],
+    [
+      "cat > heredoc.txt <<'EOF'\nr\nEOF",
+      [
+        'stat("/home/user/heredoc.txt")',
+        'stat("/usr/bin/cat")',
+        'writeFile("/home/user/heredoc.txt","r\\n")',
+      ],
+    ],
+    [
+      "v=r; cat > heredoc.txt <<EOF\n$v\nEOF",
+      [
+        'stat("/home/user/heredoc.txt")',
+        'stat("/usr/bin/cat")',
+        'writeFile("/home/user/heredoc.txt","r\\n")',
+      ],
+    ],
+    [
+      "echo -n > existing.log",
+      [
+        'stat("/home/user/existing.log")',
+        'stat("/usr/bin/echo")',
+        'writeFile("/home/user/existing.log","")',
+      ],
+    ],
+    [
+      "echo hi > a.txt > b.txt",
+      [
+        'stat("/home/user/a.txt")',
+        'writeFile("/home/user/a.txt","")',
+        'stat("/home/user/b.txt")',
+        'stat("/usr/bin/echo")',
+        'writeFile("/home/user/b.txt","hi\\n")',
+      ],
+    ],
+  ])("folds the open of %j into its one write", async (script, calls) => {
+    expect(await callsFor(script, WARM)).toEqual(calls);
+  });
+
+  it.each([
+    [
+      "echo hi > existing.log 2>&1",
+      [
+        'stat("/home/user/existing.log")',
+        'writeFile("/home/user/existing.log","")',
+        'stat("/usr/bin/echo")',
+        'writeFile("/home/user/existing.log","hi\\n")',
+      ],
+    ],
+    [
+      "cat existing.log > copy.txt",
+      [
+        'stat("/home/user/copy.txt")',
+        'writeFile("/home/user/copy.txt","")',
+        'stat("/usr/bin/cat")',
+        'readFileBytes("/home/user/existing.log")',
+        'writeFile("/home/user/copy.txt","seed\\n")',
+      ],
+    ],
+    [
+      "set -C; echo hi > new.txt",
+      [
+        'stat("/home/user/new.txt")',
+        'writeFile("/home/user/new.txt","")',
+        'stat("/usr/bin/echo")',
+        'writeFile("/home/user/new.txt","hi\\n")',
+      ],
+    ],
+  ])("keeps the eager open for %j", async (script, calls) => {
+    expect(await callsFor(script, WARM)).toEqual(calls);
   });
 });
 
