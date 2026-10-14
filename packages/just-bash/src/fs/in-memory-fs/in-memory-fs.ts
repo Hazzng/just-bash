@@ -27,6 +27,7 @@ import type {
   WriteFileOptions,
 } from "../interface.js";
 import {
+  clearSetIdOnWrite,
   DEFAULT_DIR_MODE,
   DEFAULT_FILE_MODE,
   dirname,
@@ -270,13 +271,14 @@ export class InMemoryFs implements IFileSystem {
     this.setEntry(normalized, {
       type: "file",
       content: buffer,
-      mode: metadata?.mode ?? this.modeForWrite(normalized),
+      mode:
+        metadata?.mode ?? clearSetIdOnWrite(this.existingFileMode(normalized)),
       mtime: metadata?.mtime ?? new Date(),
     });
   }
 
   // Like open(O_TRUNC), replacing a file's content keeps its permissions.
-  private modeForWrite(normalized: string): number {
+  private existingFileMode(normalized: string): number {
     const existing = this.data.get(normalized);
     return existing?.type === "file" ? existing.mode : DEFAULT_FILE_MODE;
   }
@@ -297,7 +299,8 @@ export class InMemoryFs implements IFileSystem {
     this.setEntry(normalized, {
       type: "file",
       lazy,
-      mode: metadata?.mode ?? this.modeForWrite(normalized),
+      mode:
+        metadata?.mode ?? clearSetIdOnWrite(this.existingFileMode(normalized)),
       mtime: metadata?.mtime ?? new Date(),
     });
   }
@@ -429,7 +432,10 @@ export class InMemoryFs implements IFileSystem {
       this.setEntry(normalized, {
         type: "file",
         content: combined,
-        mode: materialized.mode,
+        mode:
+          newByteLength > 0
+            ? clearSetIdOnWrite(materialized.mode)
+            : materialized.mode,
         mtime: new Date(),
       });
     } else {

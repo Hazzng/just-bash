@@ -32,6 +32,7 @@ import type {
   WriteFileOptions,
 } from "../interface.js";
 import {
+  clearSetIdOnWrite,
   DEFAULT_DIR_MODE,
   DEFAULT_FILE_MODE,
   dirname,
@@ -571,7 +572,7 @@ export class OverlayFs implements IFileSystem {
     validatePath(path, "write");
     this.assertWritable(`write '${path}'`);
     const normalized = normalizePath(path);
-    const mode = await this.modeForWrite(normalized);
+    const mode = clearSetIdOnWrite(await this.existingFileMode(normalized));
     this.ensureParentDirs(normalized);
 
     const encoding = getEncoding(options);
@@ -589,7 +590,7 @@ export class OverlayFs implements IFileSystem {
   // Like open(O_TRUNC), replacing a file's content keeps its permissions.
   // lstat sees deletions and does not follow a lower-layer symlink. A
   // lower-layer mode carries file-type bits, so keep only permissions.
-  private async modeForWrite(normalized: string): Promise<number> {
+  private async existingFileMode(normalized: string): Promise<number> {
     try {
       const stat = await this.lstat(normalized);
       return stat.isFile ? stat.mode & 0o7777 : DEFAULT_FILE_MODE;
@@ -614,6 +615,9 @@ export class OverlayFs implements IFileSystem {
       this.assertMemoryCapacity(newBuffer.byteLength);
       if (!existingEntry.appendChunks) existingEntry.appendChunks = [];
       existingEntry.appendChunks.push(newBuffer);
+      if (newBuffer.byteLength > 0) {
+        existingEntry.mode = clearSetIdOnWrite(existingEntry.mode);
+      }
       this.retainedMemoryBytes += newBuffer.byteLength;
       existingEntry.mtime = new Date();
       this.deleted.delete(normalized);
@@ -627,14 +631,14 @@ export class OverlayFs implements IFileSystem {
     } catch {
       existingBuffer = new Uint8Array(0);
     }
-    const mode = await this.modeForWrite(normalized);
+    const mode = await this.existingFileMode(normalized);
 
     this.ensureParentDirs(normalized);
     this.setMemoryEntry(normalized, {
       type: "file",
       content: existingBuffer,
       appendChunks: [newBuffer],
-      mode,
+      mode: newBuffer.byteLength > 0 ? clearSetIdOnWrite(mode) : mode,
       mtime: new Date(),
     });
     this.deleted.delete(normalized);
@@ -1251,6 +1255,10 @@ export class OverlayFs implements IFileSystem {
   async mv(src: string, dest: string): Promise<void> {
     this.assertWritable(`mv '${dest}'`);
     await this.cp(src, dest, { recursive: true });
+    // A rename keeps the source's mode, but cp keeps an existing
+    // destination's mode.
+    const srcStat = await this.stat(src);
+    if (srcStat.isFile) await this.chmod(dest, srcStat.mode & 0o7777);
     await this.rm(src, { recursive: true });
   }
 
