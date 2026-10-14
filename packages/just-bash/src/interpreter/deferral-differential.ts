@@ -25,6 +25,8 @@ export type DifferentialCase = {
   execArgs?: string[];
   /** A host command of this name that reads `f` before answering. */
   shadow?: string;
+  /** Why the two runtimes are allowed to disagree; the test then fails if they agree. */
+  knownDifference?: string;
 };
 
 type Runtime = typeof import("../index.js");
@@ -43,7 +45,7 @@ async function loadRuntime(defer: boolean): Promise<Runtime> {
   } else {
     vi.doMock("./pure-output.js", async (importOriginal) => ({
       ...(await importOriginal<typeof import("./pure-output.js")>()),
-      findDeferrableTail: () => -1,
+      deferrableOutputOpen: () => -1,
     }));
   }
   return import("../index.js");
@@ -177,8 +179,15 @@ export function itAgreesOnEveryCase(cases: DifferentialCase[]): void {
     expect(await writesFor(eager, "echo r > f")).toBe(2);
     expect(await writesFor(deferred, "echo r > f")).toBe(1);
   });
-  it.each(cases)("$name", async (c) => {
-    const expected = await outcome(eager, c);
-    expect(await outcome(deferred, c)).toEqual(expected);
-  });
+  for (const c of cases) {
+    const check = async () => {
+      const expected = await outcome(eager, c);
+      expect(await outcome(deferred, c)).toEqual(expected);
+    };
+    if (c.knownDifference) {
+      it.fails(`${c.name} (known difference: ${c.knownDifference})`, check);
+    } else {
+      it(c.name, check);
+    }
+  }
 }

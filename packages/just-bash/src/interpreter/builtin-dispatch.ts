@@ -56,6 +56,7 @@ import {
 import { handleShopt } from "./builtins/shopt.js";
 import {
   findCommandInPath as findCommandInPathHelper,
+  type ResolveCommandResult,
   resolveCommand as resolveCommandHelper,
 } from "./command-resolution.js";
 import { evaluateTestArgs } from "./conditionals.js";
@@ -759,17 +760,20 @@ export async function executeExternalCommand(
   args: string[],
   stdin: string,
   useDefaultPath: boolean,
+  preResolved?: ResolveCommandResult,
 ): Promise<ExecResult> {
   const { ctx, buildExportedEnv, executeUserScript } = dispatchCtx;
 
   // External commands - resolve via PATH
   // For command -p, use default PATH /usr/bin:/bin instead of $PATH
   const defaultPath = "/usr/bin:/bin";
-  const resolved = await resolveCommandHelper(
-    ctx,
-    commandName,
-    useDefaultPath ? defaultPath : undefined,
-  );
+  const resolved =
+    preResolved ??
+    (await resolveCommandHelper(
+      ctx,
+      commandName,
+      useDefaultPath ? defaultPath : undefined,
+    ));
   if (!resolved) {
     // Check if this is a browser-excluded command for a more helpful error
     if (isBrowserExcludedCommand(commandName)) {

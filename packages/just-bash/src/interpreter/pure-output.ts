@@ -109,6 +109,23 @@ export function findDeferrableTail(
     : -1;
 }
 
+const NO_NAMEREFS: ReadonlySet<string> = new Set();
+
+/**
+ * The index of the output open this simple command may postpone, or -1.
+ * Never under noclobber (the check must stay next to the open) or xtrace
+ * (PS4 can run user code before the command).
+ */
+export function deferrableOutputOpen(
+  ctx: InterpreterContext,
+  commandName: string,
+  redirections: readonly RedirectionNode[],
+): number {
+  const { noclobber, xtrace } = ctx.state.options;
+  if (noclobber || xtrace || !PURE_OUTPUT_COMMANDS.has(commandName)) return -1;
+  return findDeferrableTail(redirections, ctx.state.namerefs ?? NO_NAMEREFS);
+}
+
 export type PinnedResolution = Extract<ResolveCommandResult, { cmd: Command }>;
 
 /**

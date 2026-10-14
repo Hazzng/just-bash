@@ -205,6 +205,8 @@ const LIMITS: DifferentialCase[] = [
     fs: "strict",
     limits: { maxOutputSize: 10 },
     script: "echo 0123456789abcdef > nodir/f",
+    knownDifference:
+      "the command's output is charged before its open fails, so the limit error names the redirection site",
   },
   {
     name: "maxCommandCount",
