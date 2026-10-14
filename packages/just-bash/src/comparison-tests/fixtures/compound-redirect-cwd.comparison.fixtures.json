@@ -1,0 +1,101 @@
+{
+  "094009ee474f28be": {
+    "command": "top=$PWD; f() { cd d && echo out; } > e; f; echo \"rc=$?\"; echo \"[e]\"; cat \"$top/e\" 2>/dev/null; echo \"[d/e]\"; cat \"$top/d/e\" 2>/dev/null; [ \"$PWD\" = \"$top/d\" ] && echo \"pwd=d\" || echo \"pwd=top\"",
+    "files": {
+      "d/.keep": ""
+    },
+    "stdout": "rc=0\n[e]\nout\n[d/e]\npwd=d\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "19d304ba00b4aa80": {
+    "command": "top=$PWD; echo pre > e; echo pre2 > d/e; ( cd d && echo out ) > e; echo \"rc=$?\"; echo \"[e]\"; cat \"$top/e\" 2>/dev/null; echo \"[d/e]\"; cat \"$top/d/e\" 2>/dev/null; [ \"$PWD\" = \"$top/d\" ] && echo \"pwd=d\" || echo \"pwd=top\"",
+    "files": {
+      "d/.keep": ""
+    },
+    "stdout": "rc=0\n[e]\nout\n[d/e]\npre2\npwd=top\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "31f066255705aec5": {
+    "command": "top=$PWD; ( cd d && echo out ) > e; echo \"rc=$?\"; echo \"[e]\"; cat \"$top/e\" 2>/dev/null; echo \"[d/e]\"; cat \"$top/d/e\" 2>/dev/null; [ \"$PWD\" = \"$top/d\" ] && echo \"pwd=d\" || echo \"pwd=top\"",
+    "files": {
+      "d/.keep": ""
+    },
+    "stdout": "rc=0\n[e]\nout\n[d/e]\npwd=top\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "4405aa1eb9409e49": {
+    "command": "top=$PWD; { cd d && echo out; } > e; echo \"rc=$?\"; echo \"[e]\"; cat \"$top/e\" 2>/dev/null; echo \"[d/e]\"; cat \"$top/d/e\" 2>/dev/null; [ \"$PWD\" = \"$top/d\" ] && echo \"pwd=d\" || echo \"pwd=top\"",
+    "files": {
+      "d/.keep": ""
+    },
+    "stdout": "rc=0\n[e]\nout\n[d/e]\npwd=d\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "67b901e482ac2a62": {
+    "command": "top=$PWD; ( cd d && echo err >&2 ) 2> e; echo \"rc=$?\"; echo \"[e]\"; cat \"$top/e\" 2>/dev/null; echo \"[d/e]\"; cat \"$top/d/e\" 2>/dev/null; [ \"$PWD\" = \"$top/d\" ] && echo \"pwd=d\" || echo \"pwd=top\"",
+    "files": {
+      "d/.keep": ""
+    },
+    "stdout": "rc=0\n[e]\nerr\n[d/e]\npwd=top\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "7d5ea303a860a0fe": {
+    "command": "top=$PWD; f() { cd d && echo out; }; f > e; echo \"rc=$?\"; echo \"[e]\"; cat \"$top/e\" 2>/dev/null; echo \"[d/e]\"; cat \"$top/d/e\" 2>/dev/null; [ \"$PWD\" = \"$top/d\" ] && echo \"pwd=d\" || echo \"pwd=top\"",
+    "files": {
+      "d/.keep": ""
+    },
+    "stdout": "rc=0\n[e]\nout\n[d/e]\npwd=d\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "ad045a83a7d9f615": {
+    "command": "top=$PWD; mkdir sub; ( cd d && echo out ) > sub/e; cat sub/e; echo \"rc=$?\"; echo \"[e]\"; cat \"$top/e\" 2>/dev/null; echo \"[d/e]\"; cat \"$top/d/e\" 2>/dev/null; [ \"$PWD\" = \"$top/d\" ] && echo \"pwd=d\" || echo \"pwd=top\"",
+    "files": {
+      "d/.keep": ""
+    },
+    "stdout": "out\nrc=0\n[e]\n[d/e]\npwd=top\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "bf600c9d8af8d9bc": {
+    "command": "top=$PWD; echo pre > e; ( cd d && echo out ) >> e; echo \"rc=$?\"; echo \"[e]\"; cat \"$top/e\" 2>/dev/null; echo \"[d/e]\"; cat \"$top/d/e\" 2>/dev/null; [ \"$PWD\" = \"$top/d\" ] && echo \"pwd=d\" || echo \"pwd=top\"",
+    "files": {
+      "d/.keep": ""
+    },
+    "stdout": "rc=0\n[e]\npre\nout\n[d/e]\npwd=top\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "c2c70fd30bf6f5a2": {
+    "command": "top=$PWD; ( cd d && echo out; echo err >&2 ) &> e; echo \"rc=$?\"; echo \"[e]\"; cat \"$top/e\" 2>/dev/null; echo \"[d/e]\"; cat \"$top/d/e\" 2>/dev/null; [ \"$PWD\" = \"$top/d\" ] && echo \"pwd=d\" || echo \"pwd=top\"",
+    "files": {
+      "d/.keep": ""
+    },
+    "stdout": "rc=0\n[e]\nout\nerr\n[d/e]\npwd=top\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "cfc8e9cb338ada39": {
+    "command": "top=$PWD; set -o noclobber; echo pre > d/e; ( cd d && echo out ) > e; echo \"rc=$?\"; echo \"[e]\"; cat \"$top/e\" 2>/dev/null; echo \"[d/e]\"; cat \"$top/d/e\" 2>/dev/null; [ \"$PWD\" = \"$top/d\" ] && echo \"pwd=d\" || echo \"pwd=top\"",
+    "files": {
+      "d/.keep": ""
+    },
+    "stdout": "rc=0\n[e]\nout\n[d/e]\npre\npwd=top\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "e5d0df106d7f714f": {
+    "command": "top=$PWD; for x in out; do cd d && echo $x; done > e; echo \"rc=$?\"; echo \"[e]\"; cat \"$top/e\" 2>/dev/null; echo \"[d/e]\"; cat \"$top/d/e\" 2>/dev/null; [ \"$PWD\" = \"$top/d\" ] && echo \"pwd=d\" || echo \"pwd=top\"",
+    "files": {
+      "d/.keep": ""
+    },
+    "stdout": "rc=0\n[e]\nout\n[d/e]\npwd=d\n",
+    "stderr": "",
+    "exitCode": 0
+  }
+}

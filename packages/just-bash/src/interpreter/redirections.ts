@@ -144,7 +144,12 @@ type PreparedDupSource =
   | { kind: "standard"; fd: number }
   | { kind: "entry"; entry: FdEntry; descriptors: number[] };
 
-export type PreparedDupSources = Map<number, PreparedDupSource>;
+type PreparedFileTarget = { kind: "file"; path: string; append: boolean };
+
+export type PreparedDupSources = Map<
+  number,
+  PreparedDupSource | PreparedFileTarget
+>;
 
 export type PreparedRedirections = {
   targets: ExpandedRedirectTargets;
@@ -970,6 +975,12 @@ async function prepareRedirectionsWithState(
         }
         dupSources.set(index, source);
         if (source.kind === "entry") entry = source.entry;
+      } else if (entry.kind === "output") {
+        dupSources.set(index, {
+          kind: "file",
+          path: entry.path,
+          append: entry.append,
+        });
       }
       if (both) {
         persistStandard(1, entry);
@@ -1225,10 +1236,13 @@ export async function applyRedirections(
     return null;
   };
   const sinkFromDupSource = (
-    source: PreparedDupSource | undefined,
+    source: PreparedDupSource | PreparedFileTarget | undefined,
   ): RedirectSink | null => {
     if (!source) return null;
     if (source.kind === "entry") return entrySink(source);
+    if (source.kind === "file") {
+      return source.path === DEV_NULL ? { kind: "discard" } : source;
+    }
     if (source.fd === 1) return fd1Sink;
     if (source.fd === 2) return fd2Sink;
     return null;
@@ -1275,33 +1289,13 @@ export async function applyRedirections(
         if (fd !== 1 && fd !== 2) {
           break;
         }
-        const isAppend = redir.operator === ">>" || redir.operator === "&>>";
-        const dest = classifyOutputTarget(ctx, target);
-        if (dest.kind === "full") {
-          // /dev/full always returns ENOSPC when written to. The diagnostic
-          // stays on live stderr and the fd's sink is left unchanged.
-          stderr += `bash: echo: write error: No space left on device\n`;
-          exitCode = 1;
-          if (fd === 1) {
-            stdout = "";
-          }
-          break;
-        }
         // Opening /dev/stdout or /dev/stderr duplicates the CURRENT target
         // of fd 1 / fd 2, like `N>&1` / `N>&2`: `> /dev/stderr` re-points
         // fd 1 to wherever fd 2 points right now, and the self-referential
         // forms (`> /dev/stdout`, `2> /dev/stderr`) are no-ops — after
         // `> a > /dev/stdout` content still goes to `a`.
-        let sink: RedirectSink;
-        if (dest.kind === "stream") {
-          const sourceSink = sinkFromDupSource(dupSources.get(i));
-          if (!sourceSink) break;
-          sink = sourceSink;
-        } else if (dest.kind === "null") {
-          sink = { kind: "discard" };
-        } else {
-          sink = { kind: "file", path: dest.path, append: isAppend };
-        }
+        const sink = sinkFromDupSource(dupSources.get(i));
+        if (!sink) break;
         if (fd === 1) {
           fd1Sink = sink;
         } else {
