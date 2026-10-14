@@ -975,14 +975,7 @@ export class Interpreter {
       cmdResult = pinned
         ? {
             ...(await executeExternalCommand(
-              {
-                ctx: this.ctx,
-                runCommand: (name, a, qa, s, sf, udp, ssf, sr) =>
-                  this.runCommand(name, a, qa, s, sf, udp, ssf, sr),
-                buildExportedEnv: () => this.buildExportedEnv(),
-                executeUserScript: (path, a, s) =>
-                  this.executeUserScript(path, a, s),
-              },
+              this.dispatchContext(),
               commandName,
               args,
               stdin,
@@ -1127,6 +1120,16 @@ export class Interpreter {
     return cmdResult;
   }
 
+  private dispatchContext(): BuiltinDispatchContext {
+    return {
+      ctx: this.ctx,
+      runCommand: (name, a, qa, s, sf, udp, ssf, sr) =>
+        this.runCommand(name, a, qa, s, sf, udp, ssf, sr),
+      buildExportedEnv: () => this.buildExportedEnv(),
+      executeUserScript: (path, a, s) => this.executeUserScript(path, a, s),
+    };
+  }
+
   private async runCommand(
     commandName: string,
     args: string[],
@@ -1137,13 +1140,7 @@ export class Interpreter {
     stdinSourceFd = -1,
     stdinRedirected = false,
   ): Promise<ExecResult> {
-    const dispatchCtx: BuiltinDispatchContext = {
-      ctx: this.ctx,
-      runCommand: (name, a, qa, s, sf, udp, ssf, sr) =>
-        this.runCommand(name, a, qa, s, sf, udp, ssf, sr),
-      buildExportedEnv: () => this.buildExportedEnv(),
-      executeUserScript: (path, a, s) => this.executeUserScript(path, a, s),
-    };
+    const dispatchCtx = this.dispatchContext();
 
     // Try builtin dispatch first
     const builtinResult = await dispatchBuiltin(
