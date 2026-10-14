@@ -92,6 +92,7 @@ import {
   markProcessSubstitutions,
   releaseProcessSubstitutions,
 } from "./process-substitution.js";
+import { deferrableOutputOpen, pinPureOutput } from "./pure-output.js";
 import {
   applyRedirections,
   BARE_REDIRECTION_POLICY,
@@ -618,7 +619,8 @@ export class Interpreter {
         transaction = created;
       });
     } catch (error) {
-      transaction?.finish();
+      const openFailure = await transaction?.unwind();
+      if (openFailure) return openFailure;
       if (error instanceof GlobError) {
         // GlobError from failglob should return exit code 1 with error message
         return failure(error.stderr);
@@ -867,6 +869,7 @@ export class Interpreter {
       commandName === "exec"
         ? EXEC_REDIRECTION_POLICY
         : SIMPLE_REDIRECTION_POLICY,
+      deferrableOutputOpen(this.ctx, commandName, node.redirections),
     );
     onTransaction(transaction);
     const preparedRedirections = await transaction.prepare(stdin);
@@ -935,6 +938,22 @@ export class Interpreter {
       for (const extraArg of extraArgs) appendArgument(extraArg, true);
     }
 
+    // An owed output open either folds into the delivery write (the command
+    // is pure, so running it first is unobservable) or happens now, before
+    // anything can observe the target, exactly as prepare would have done.
+    const owed = preparedRedirections.owed;
+    const pinned = owed
+      ? await pinPureOutput(this.ctx, commandName, args, stdinSourceFd)
+      : null;
+    if (owed && !pinned) {
+      const failure = await owed.settle("", "binary");
+      if (failure) {
+        restoreTempAssignments();
+        transaction.finish();
+        return failure;
+      }
+    }
+
     // Generate xtrace output before running the command
     const xtraceOutput = await traceSimpleCommand(this.ctx, commandName, args);
 
@@ -950,16 +969,31 @@ export class Interpreter {
     let controlFlowError: BreakError | ContinueError | null = null;
 
     try {
-      cmdResult = await this.runCommand(
-        commandName,
-        args,
-        quotedArgs,
-        stdin,
-        false,
-        false,
-        stdinSourceFd,
-        stdinRedirected,
-      );
+      // A pinned command is bundled, so the builtin dispatch has nothing to
+      // add; executing exactly the pinned resolution is what makes the
+      // purity decision hold.
+      cmdResult = pinned
+        ? {
+            ...(await executeExternalCommand(
+              this.dispatchContext(),
+              commandName,
+              args,
+              stdin,
+              false,
+              pinned,
+            )),
+            internalProducerCommand: commandName,
+          }
+        : await this.runCommand(
+            commandName,
+            args,
+            quotedArgs,
+            stdin,
+            false,
+            false,
+            stdinSourceFd,
+            stdinRedirected,
+          );
     } catch (error) {
       // For break/continue, we still need to apply redirections before propagating
       // This handles cases like "break > file" where the file should be created
@@ -997,7 +1031,16 @@ export class Interpreter {
       preparedRedirections.standardRoutes,
       cmdResult.internalProducerCommand ?? commandName,
       cmdResult.internalProducerOmitsShellPrefix,
+      owed,
     );
+    if (owed?.state.kind === "failed") {
+      // The open failed, so as far as the shell can tell the command never
+      // ran: leave exactly the way a failed prepare does.
+      restoreTempAssignments();
+      if (tempAssignments.size > 0) this.ctx.state.tempEnvBindings?.pop();
+      transaction.finish();
+      return owed.state.failure;
+    }
     transaction.finish();
 
     // If we caught a break/continue error, re-throw it after applying redirections
@@ -1077,6 +1120,16 @@ export class Interpreter {
     return cmdResult;
   }
 
+  private dispatchContext(): BuiltinDispatchContext {
+    return {
+      ctx: this.ctx,
+      runCommand: (name, a, qa, s, sf, udp, ssf, sr) =>
+        this.runCommand(name, a, qa, s, sf, udp, ssf, sr),
+      buildExportedEnv: () => this.buildExportedEnv(),
+      executeUserScript: (path, a, s) => this.executeUserScript(path, a, s),
+    };
+  }
+
   private async runCommand(
     commandName: string,
     args: string[],
@@ -1087,13 +1140,7 @@ export class Interpreter {
     stdinSourceFd = -1,
     stdinRedirected = false,
   ): Promise<ExecResult> {
-    const dispatchCtx: BuiltinDispatchContext = {
-      ctx: this.ctx,
-      runCommand: (name, a, qa, s, sf, udp, ssf, sr) =>
-        this.runCommand(name, a, qa, s, sf, udp, ssf, sr),
-      buildExportedEnv: () => this.buildExportedEnv(),
-      executeUserScript: (path, a, s) => this.executeUserScript(path, a, s),
-    };
+    const dispatchCtx = this.dispatchContext();
 
     // Try builtin dispatch first
     const builtinResult = await dispatchBuiltin(

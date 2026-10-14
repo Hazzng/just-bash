@@ -165,6 +165,25 @@ export type PreparedRedirections = {
   stdinSourceFd: number;
   error: ExecResult | null;
   errorCause?: ExitError | ExecutionLimitError;
+  owed?: OwedOpen;
+};
+
+/**
+ * An output open postponed until the command's output is delivered, so the
+ * open and the delivery are one backend write. Settling it performs the open
+ * with `content` as the first write; it runs at most once, and a failure is
+ * the eager failure prepare would have returned at this index.
+ */
+export type OwedOpen = {
+  readonly index: number;
+  state:
+    | { kind: "pending" }
+    | { kind: "opened" }
+    | { kind: "failed"; failure: ExecResult };
+  settle(
+    content: string,
+    encoding: "binary" | "utf8",
+  ): Promise<ExecResult | null>;
 };
 
 export type RedirectionPolicy = "scoped" | "bare" | "persistent";
@@ -181,10 +200,19 @@ type RedirectionTransactionState = {
   fdVariableEnv: Map<string, string | undefined>;
   nextFd: number | undefined;
   policy: RedirectionPolicy;
+  /** Position of the output open to postpone, or -1. */
+  deferIndex: number;
+  owed?: OwedOpen;
 };
 
 export type RedirectionTransaction = {
   prepare: (inheritedStdin?: string) => Promise<PreparedRedirections>;
+  /**
+   * Ends the transaction on a throw. A still-pending owed open happens now,
+   * because in eager order it preceded whatever threw; its failure, if any,
+   * is the result the command would have returned instead of throwing.
+   */
+  unwind: () => Promise<ExecResult | null>;
   finish: () => void;
 };
 
@@ -239,13 +267,16 @@ const getDupSource = (
     : null;
 };
 
-async function openOutputEntry(
+/**
+ * Classify and check an output target. A `file` result passed every check
+ * and still needs its first write, which is what opens it.
+ */
+async function checkOutputTarget(
   ctx: InterpreterContext,
   target: string,
   append: boolean,
   isClobber: boolean,
-  handleWriteError = true,
-): Promise<{ entry?: FdEntry; error?: ExecResult }> {
+): Promise<{ entry: FdEntry } | { error: ExecResult } | { file: string }> {
   const filePath = ctx.fs.resolvePath(ctx.state.cwd, target);
   if (filePath === DEV_NULL) {
     return { entry: { kind: "output", path: DEV_NULL, append } };
@@ -266,15 +297,51 @@ async function openOutputEntry(
   if (target === "/dev/stderr") {
     return { entry: { kind: "dup-out", sourceFd: 2 } };
   }
+  return { file: filePath };
+}
+
+/** Open a checked file target by writing `content` to it; the open's failure, or null. */
+async function openOutputFile(
+  ctx: InterpreterContext,
+  target: string,
+  path: string,
+  append: boolean,
+  content: string,
+  encoding: "binary" | "utf8",
+  handleWriteError: boolean,
+): Promise<ExecResult | null> {
   try {
-    await writeOutputTarget(ctx, filePath, append, "", "binary");
+    await writeOutputTarget(ctx, path, append, content, encoding);
+    return null;
   } catch (error) {
     const diagnostic = outputOpenDiagnostic(target, error);
-    if (diagnostic) return { error: makeResult("", diagnostic, 1) };
+    if (diagnostic) return makeResult("", diagnostic, 1);
     if (!handleWriteError) throw error;
-    return { error: makeResult("", unknownOpenError(target), 1) };
+    return makeResult("", unknownOpenError(target), 1);
   }
-  return { entry: { kind: "output", path: filePath, append } };
+}
+
+async function openOutputEntry(
+  ctx: InterpreterContext,
+  target: string,
+  append: boolean,
+  isClobber: boolean,
+  handleWriteError = true,
+): Promise<{ entry?: FdEntry; error?: ExecResult }> {
+  const checked = await checkOutputTarget(ctx, target, append, isClobber);
+  if (!("file" in checked)) return checked;
+  const error = await openOutputFile(
+    ctx,
+    target,
+    checked.file,
+    append,
+    "",
+    "binary",
+    handleWriteError,
+  );
+  return error
+    ? { error }
+    : { entry: { kind: "output", path: checked.file, append } };
 }
 
 async function readInputEntry(
@@ -384,27 +451,71 @@ async function prepareRedirectionsWithState(
     stdin,
     stdinSourceFd,
     error: null,
+    owed: transaction.owed,
   });
+  const routeFailure = (
+    error: ExecResult,
+    index: number,
+    routes: Map<number, FdEntry>,
+  ): Promise<ExecResult> =>
+    applyRedirections(
+      ctx,
+      error,
+      redirections.slice(0, index),
+      targets,
+      dupSources,
+      routes,
+    );
   const fail = async (
     error: ExecResult,
     index: number,
     errorCause?: ExitError | ExecutionLimitError,
   ): Promise<PreparedRedirections> => {
+    const owed = transaction.owed;
+    if (owed && owed.index < index && owed.state.kind === "pending") {
+      const earlier = await owed.settle("", "binary");
+      if (earlier) return { ...base(), error: earlier };
+    }
     const prepared = {
       ...base(),
-      error: await applyRedirections(
-        ctx,
-        error,
-        redirections.slice(0, index),
-        targets,
-        dupSources,
-        standardRoutes,
-      ),
+      error: await routeFailure(error, index, standardRoutes),
     };
     if (errorCause) {
       return { ...prepared, errorCause };
     }
     return prepared;
+  };
+  const oweOpen = (
+    index: number,
+    target: string,
+    path: string,
+    append: boolean,
+  ): OwedOpen => {
+    const routesBefore = new Map(standardRoutes);
+    const owed: OwedOpen = {
+      index,
+      state: { kind: "pending" },
+      settle: async (content, encoding) => {
+        if (owed.state.kind !== "pending") {
+          return owed.state.kind === "failed" ? owed.state.failure : null;
+        }
+        owed.state = { kind: "opened" };
+        const error = await openOutputFile(
+          ctx,
+          target,
+          path,
+          append,
+          content,
+          encoding,
+          false,
+        );
+        if (!error) return null;
+        const failure = await routeFailure(error, index, routesBefore);
+        owed.state = { kind: "failed", failure };
+        return failure;
+      },
+    };
+    return owed;
   };
   const requireCapacity = async (
     fd: number,
@@ -949,15 +1060,36 @@ async function prepareRedirectionsWithState(
       redir.operator === "&>" ||
       redir.operator === "&>>"
     ) {
-      const opened = await openOutputEntry(
+      const append = redir.operator === ">>" || redir.operator === "&>>";
+      const checked = await checkOutputTarget(
         ctx,
         target,
-        redir.operator === ">>" || redir.operator === "&>>",
+        append,
         redir.operator === ">|",
-        false,
       );
-      if (opened.error) return fail(opened.error, index);
-      const entry = opened.entry as FdEntry;
+      if ("error" in checked) return fail(checked.error, index);
+      let entry: FdEntry;
+      if (!("file" in checked)) {
+        entry = checked.entry;
+      } else if (
+        index === transaction.deferIndex &&
+        !ctx.state.options.noclobber
+      ) {
+        transaction.owed = oweOpen(index, target, checked.file, append);
+        entry = { kind: "output", path: checked.file, append };
+      } else {
+        const error = await openOutputFile(
+          ctx,
+          target,
+          checked.file,
+          append,
+          "",
+          "binary",
+          false,
+        );
+        if (error) return fail(error, index);
+        entry = { kind: "output", path: checked.file, append };
+      }
       if (redir.operator === "&>" || redir.operator === "&>>") {
         persistStandard(1, entry);
         persistStandard(2, entry);
@@ -1005,6 +1137,7 @@ export function createRedirectionTransaction(
   ctx: InterpreterContext,
   redirections: RedirectionNode[],
   policy: RedirectionPolicy,
+  deferIndex = -1,
 ): RedirectionTransaction {
   const state: RedirectionTransactionState = {
     numericSnapshot: new Map(),
@@ -1014,37 +1147,46 @@ export function createRedirectionTransaction(
     fdVariableEnv: new Map(),
     nextFd: ctx.state.nextFd,
     policy,
+    deferIndex,
   };
   let finished = false;
+  const finish = (): void => {
+    if (finished) return;
+    finished = true;
+    if (policy !== "persistent") {
+      restoreFds(ctx, state.numericSnapshot);
+    }
+    if (policy !== "persistent") {
+      restoreFds(ctx, state.standardSnapshot);
+      for (const [fd, wasClosed] of state.standardClosedSnapshot) {
+        if (wasClosed) {
+          ctx.state.closedStandardFds ??= new Set();
+          ctx.state.closedStandardFds.add(fd);
+        } else {
+          ctx.state.closedStandardFds?.delete(fd);
+        }
+      }
+    }
+    if (policy === "bare") {
+      restoreFds(ctx, state.fdVariableSnapshot);
+      for (const [name, value] of state.fdVariableEnv) {
+        if (value === undefined) ctx.state.env.delete(name);
+        else ctx.state.env.set(name, value);
+      }
+      ctx.state.nextFd = state.nextFd;
+    }
+  };
   return {
     prepare: (inheritedStdin = "") =>
       prepareRedirectionsWithState(ctx, redirections, inheritedStdin, state),
-    finish: () => {
-      if (finished) return;
-      finished = true;
-      if (policy !== "persistent") {
-        restoreFds(ctx, state.numericSnapshot);
-      }
-      if (policy !== "persistent") {
-        restoreFds(ctx, state.standardSnapshot);
-        for (const [fd, wasClosed] of state.standardClosedSnapshot) {
-          if (wasClosed) {
-            ctx.state.closedStandardFds ??= new Set();
-            ctx.state.closedStandardFds.add(fd);
-          } else {
-            ctx.state.closedStandardFds?.delete(fd);
-          }
-        }
-      }
-      if (policy === "bare") {
-        restoreFds(ctx, state.fdVariableSnapshot);
-        for (const [name, value] of state.fdVariableEnv) {
-          if (value === undefined) ctx.state.env.delete(name);
-          else ctx.state.env.set(name, value);
-        }
-        ctx.state.nextFd = state.nextFd;
+    unwind: async () => {
+      try {
+        return state.owed ? await state.owed.settle("", "binary") : null;
+      } finally {
+        finish();
       }
     },
+    finish,
   };
 }
 
@@ -1145,6 +1287,7 @@ export async function applyRedirections(
   standardRoutes: Map<number, FdEntry> = new Map(),
   writeErrorCommand = "bash",
   omitShellPrefix = false,
+  owed?: OwedOpen,
 ): Promise<ExecResult> {
   // Output redirected away from the caller still consumes the shared budget.
   // Unredirected pipeline output is charged once at the pipeline boundary.
@@ -1186,7 +1329,7 @@ export async function applyRedirections(
   type RedirectSink =
     | { kind: "live-stdout" }
     | { kind: "live-stderr" }
-    | { kind: "file"; path: string; append: boolean }
+    | { kind: "file"; path: string; append: boolean; owed?: OwedOpen }
     | {
         kind: "descriptor";
         source: Extract<PreparedDupSource, { kind: "entry" }>;
@@ -1291,7 +1434,12 @@ export async function applyRedirections(
         const sink: RedirectSink =
           filePath === DEV_NULL
             ? { kind: "discard" }
-            : { kind: "file", path: filePath, append: isAppend };
+            : {
+                kind: "file",
+                path: filePath,
+                append: isAppend,
+                owed: owed?.index === i ? owed : undefined,
+              };
         if (fd === 1) {
           fd1Sink = sink;
         } else {
@@ -1332,6 +1480,7 @@ export async function applyRedirections(
                 kind: "file",
                 path: filePath,
                 append: redir.operator === "&>>",
+                owed: owed?.index === i ? owed : undefined,
               };
         fd2Sink = fd1Sink;
         break;
@@ -1350,6 +1499,23 @@ export async function applyRedirections(
   // descriptors, each writing from its own start position, so the later
   // non-empty write clobbers the earlier one — matching bash's
   // independent-open behavior.
+  //
+  // An owed open settles first, carrying whatever routing sends to it, so
+  // a failing open delivers nothing anywhere and returns the eager failure.
+  if (owed?.state.kind === "pending") {
+    const toOwed = (sink: RedirectSink): boolean =>
+      sink.kind === "file" && sink.owed === owed;
+    const sendsStdout = toOwed(fd1Sink);
+    const sendsStderr = toOwed(fd2Sink);
+    const content = (sendsStdout ? stdout : "") + (sendsStderr ? stderr : "");
+    const failure = await owed.settle(
+      content,
+      sendsStdout ? stdoutFileEncoding : getFileEncoding(content),
+    );
+    if (failure) return failure;
+    if (sendsStdout) stdout = "";
+    if (sendsStderr) stderr = "";
+  }
   if (stdout !== "" || stderr !== "") {
     let pendingStdout = stdout;
     let pendingStderr = stderr;
