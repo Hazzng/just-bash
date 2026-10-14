@@ -14,6 +14,8 @@ const cases: [string, string, string, number][] = [
   [`${group} 1>&2 2>/dev/null`, "", "out\n", 0],
   [`${group} 2>/dev/null > /dev/stderr; echo after`, "after\n", "", 0],
   ["echo x > a > /dev/stdout; echo rc=$?; cat a", "rc=0\nx\n", "", 0],
+  [`${group} &> /dev/stderr 2>/dev/null; echo after`, "after\n", "out\n", 0],
+  [`${group} &> /dev/stdout > f; echo [; cat f`, "err\n[\nout\n", "", 0],
 ];
 
 describe("/dev/stdout and /dev/stderr follow the fd as of that redirect", () => {
