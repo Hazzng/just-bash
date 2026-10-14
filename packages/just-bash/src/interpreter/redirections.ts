@@ -958,8 +958,20 @@ async function prepareRedirectionsWithState(
         false,
       );
       if (opened.error) return fail(opened.error, index);
-      const entry = opened.entry as FdEntry;
-      if (redir.operator === "&>" || redir.operator === "&>>") {
+      let entry = opened.entry as FdEntry;
+      const both = redir.operator === "&>" || redir.operator === "&>>";
+      if (entry.kind === "dup-out") {
+        const source = getPreparedDupSource(entry.sourceFd, false);
+        if (!source) {
+          return fail(
+            makeResult("", `bash: ${target}: Bad file descriptor\n`, 1),
+            index,
+          );
+        }
+        dupSources.set(index, source);
+        if (source.kind === "entry") entry = source.entry;
+      }
+      if (both) {
         persistStandard(1, entry);
         persistStandard(2, entry);
       } else {
@@ -1282,7 +1294,9 @@ export async function applyRedirections(
         // `> a > /dev/stdout` content still goes to `a`.
         let sink: RedirectSink;
         if (dest.kind === "stream") {
-          sink = dest.fd === 1 ? fd1Sink : fd2Sink;
+          const sourceSink = sinkFromDupSource(dupSources.get(i));
+          if (!sourceSink) break;
+          sink = sourceSink;
         } else if (dest.kind === "null") {
           sink = { kind: "discard" };
         } else {
